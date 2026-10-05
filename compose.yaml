@@ -1,0 +1,13 @@
+services:
+  media-sorter:
+    image: kalinkasolutions/media-sorter:latest
+    container_name: media-sorter
+    restart: unless-stopped
+    env_file: media-sorter.env
+    # the shares are group storage with no access for others; STORAGE_GID is `getent group storage`
+    user: "${PUID:-1000}:${STORAGE_GID:?set STORAGE_GID in .env}"
+    volumes:
+      - ${DOWNLOADS_PATH:-/mnt/shared/jdownloader}:/downloads
+      # autofs mounts, so the container needs to see them mounted after it started
+      - ${MOVIES_PATH:-/mnt/movies}:/movies:rslave
+      - ${SERIES_PATH:-/mnt/series}:/series:rslave

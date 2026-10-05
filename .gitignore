@@ -1,0 +1,4 @@
+# hold the TMDb key and the Plex token
+.env
+media-sorter.env
+__pycache__/
