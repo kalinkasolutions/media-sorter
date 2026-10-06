@@ -18,6 +18,9 @@ CATALOGUE = {
         {"title": "Dune: Part Two", "release_date": "2024-02-27"},
         {"title": "Dune", "release_date": "2021-09-15"},
         {"title": "Schreiner", "release_date": "2011-01-01"},
+        {"title": "2001: A Space Odyssey", "release_date": "1968-04-02"},
+        {"title": "13 Hours: The Secret Soldiers of Benghazi", "release_date": "2016-01-13"},
+        {"title": "28 Years Later: The Bone Temple", "release_date": "2026-01-14"},
     ],
     "tv": [
         {"name": "Elsbeth", "first_air_date": "2024-02-29"},
@@ -99,12 +102,14 @@ def run_rounds(monkeypatch, rounds: int, before_round=None) -> list[set[str]]:
 
 
 @pytest.mark.parametrize("name, expected", [
-    ("Mission: Impossible (1996)", "Mission - Impossible (1996)"),
+    ("Mission: Impossible (1996)", "Mission Impossible (1996)"),
+    ("2:22 (2017)", "2 22 (2017)"),
+    ("13 Hours: The Secret Soldiers of Benghazi (2016)", "13 Hours The Secret Soldiers of Benghazi (2016)"),
     ('What? A "Movie" (2020)', "What A Movie (2020)"),
     ("AC/DC Live (1991)", "ACDC Live (1991)"),
     ("Trailing dot.", "Trailing dot"),
 ])
-def test_safe_filename_drops_characters_windows_and_plex_trip_over(name, expected):
+def test_safe_filename_follows_the_library_and_drops_characters_windows_trips_over(name, expected):
     assert sorter.safe_filename(name) == expected
 
 
@@ -126,6 +131,21 @@ def test_with_umlauts():
 ])
 def test_is_sample(path, expected):
     assert sorter.is_sample(sorter.Path(path)) == expected
+
+
+@pytest.mark.parametrize("a, b", [
+    ("2 22 (2017)", "2:22 (2017)"),
+    ("28 Years Later: The Bone Temple (2026)", "28 Years Later The Bone Temple (2026)"),
+    ("Zum Glück gibts Schreiner (2020)", "Zum Glück gibt's Schreiner (2020)"),
+    ("Spiderman (2002)", "Spider-Man (2002)"),
+    ("the bear (2022)", "The Bear (2022)"),
+])
+def test_folder_key_ignores_spelling(a, b):
+    assert sorter.folder_key(a) == sorter.folder_key(b)
+
+
+def test_folder_key_keeps_the_year_apart():
+    assert sorter.folder_key("Dune (1984)") != sorter.folder_key("Dune (2021)")
 
 
 # TMDb search
@@ -161,7 +181,7 @@ def test_tmdb_lookup_falls_back_to_no_year_when_the_year_is_off():
 
 
 def test_tmdb_lookup_makes_the_name_safe_for_a_folder():
-    assert sorter.tmdb_lookup("movie", "Dune Part Two", 2024) == "Dune - Part Two (2024)"
+    assert sorter.tmdb_lookup("movie", "Dune Part Two", 2024) == "Dune Part Two (2024)"
 
 
 def test_tmdb_lookup_for_series():
@@ -233,7 +253,7 @@ def test_plan_movie_with_a_part_in_its_title(library):
     item = sorter.DOWNLOADS / "Dune.Part.Two.2024.1080p.WEB-DL.x265-GRP"
     video = download(f"{item.name}/movie.mkv")
 
-    assert sorter.plan(item)[0].destination == sorter.MOVIES / "Dune - Part Two (2024)" / "movie.mkv"
+    assert sorter.plan(item)[0].destination == sorter.MOVIES / "Dune Part Two (2024)" / "movie.mkv"
 
 
 def test_plan_season_pack_puts_every_episode_into_its_season_folder(library):
@@ -268,6 +288,37 @@ def test_plan_leaves_a_movie_tmdb_does_not_know(library):
 
     with pytest.raises(sorter.NotRecognised, match="TMDb has no movie"):
         sorter.plan(item)
+
+
+@pytest.mark.parametrize("existing, release", [
+    ("2001 A Space Odyssey (1968)", "2001.A.Space.Odyssey.1968.1080p.BluRay"),
+    ("13 Hours The Secret Soldiers of Benghazi (2016)", "13.Hours.The.Secret.Soldiers.of.Benghazi.2016.1080p.BluRay"),
+    ("28 Years Later: The Bone Temple (2026)", "28.Years.Later.The.Bone.Temple.2026.1080p.WEB"),
+])
+def test_plan_movie_reuses_the_existing_folder_even_when_spelled_differently(library, existing, release):
+    (sorter.MOVIES / existing).mkdir()
+    item = sorter.DOWNLOADS / release
+    download(f"{release}/movie.mkv")
+
+    assert sorter.plan(item)[0].destination == sorter.MOVIES / existing / "movie.mkv"
+
+
+def test_plan_movie_does_not_reuse_a_folder_of_another_year(library):
+    (sorter.MOVIES / "Dune (1984)").mkdir()
+    item = sorter.DOWNLOADS / "Dune.2021.1080p.WEB"
+    download(f"{item.name}/movie.mkv")
+
+    assert sorter.plan(item)[0].destination == sorter.MOVIES / "Dune (2021)" / "movie.mkv"
+
+
+def test_plan_episode_puts_a_new_season_into_the_existing_show_folder(library):
+    (sorter.SERIES / "the bear (2022)" / "Season 01").mkdir(parents=True)
+    item = sorter.DOWNLOADS / "The.Bear.S02E01.1080p.WEB"
+    download(f"{item.name}/the.bear.s02e01.mkv")
+
+    assert sorter.plan(item)[0].destination == (
+        sorter.SERIES / "the bear (2022)" / "Season 02" / "The Bear (2022) - S02E01.mkv"
+    )
 
 
 # Moving

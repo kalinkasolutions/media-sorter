@@ -104,8 +104,26 @@ def shown(path: Path) -> str:
 
 
 def safe_filename(name: str) -> str:
-    name = name.replace(": ", " - ")
-    return re.sub(r'[<>:"/\\|?*]', "", name).strip(" .")
+    # a colon becomes a space, as in the existing library: "2001 A Space Odyssey (1968)", "2 22 (2017)"
+    name = re.sub(r'[<>:"/\\|?*]', lambda match: " " if match.group() == ":" else "", name)
+    return re.sub(r"\s+", " ", name).strip(" .")
+
+
+def folder_key(name: str) -> str:
+    # letters and digits only, so "gibt's" matches "gibts" and "Spider-Man" matches "Spiderman"
+    return "".join(re.findall(r"[^\W_]+", name.casefold()))
+
+
+def library_folder(library: Path, name: str) -> Path:
+    """The folder for name, reusing one that is only spelled differently, like "2 22 (2017)" for "2:22 (2017)"."""
+    if (library / name).is_dir():
+        return library / name
+    wanted = folder_key(name)
+    if library.is_dir():
+        for existing in library.iterdir():
+            if existing.is_dir() and folder_key(existing.name) == wanted:
+                return existing
+    return library / name
 
 
 def episode_code(season: int, episode: int | list[int]) -> str:
@@ -187,7 +205,7 @@ def plan_movie(video: Path, guess: dict) -> Placement:
     if not name:
         year = f" ({guess['year']})" if guess.get("year") else ""
         raise NotRecognised(f"TMDb has no movie '{guess['title']}'{year}")
-    return Placement(video, MOVIES / name / video.name, "movie")
+    return Placement(video, library_folder(MOVIES, name) / video.name, "movie")
 
 
 def plan_episode(video: Path, guess: dict) -> Placement:
@@ -198,7 +216,7 @@ def plan_episode(video: Path, guess: dict) -> Placement:
     show = tmdb_lookup("tv", guess["title"], guess.get("year"))
     if not show:
         raise NotRecognised(f"TMDb has no series '{guess['title']}'")
-    season_folder = SERIES / show / f"Season {guess['season']:02}"
+    season_folder = library_folder(SERIES, show) / f"Season {guess['season']:02}"
     file_name = f"{show} - {episode_code(guess['season'], guess['episode'])}{video.suffix.lower()}"
     return Placement(video, season_folder / file_name, "show")
 
