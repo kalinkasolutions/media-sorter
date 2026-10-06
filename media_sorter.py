@@ -242,6 +242,12 @@ def file_into_library(item: Path, placements: list[Placement]) -> None:
                 placement.destination.unlink(missing_ok=True)
             raise MoveFailed(f"{placement.source.name} -> {shown(placement.destination)}: {error.strerror or error}")
         log.info("Moved %s -> %s", placement.source.relative_to(DOWNLOADS), shown(placement.destination))
+        # only movies: a season folder holds other episodes, not other versions
+        if placement.plex_type == "movie":
+            versions = len(videos_in(placement.destination.parent))
+            if versions > 1:
+                # the Grafana alert "media-sorter duplicate" matches this wording; change both together
+                log.info("Duplicate: copied %s, the folder now has %d versions", placement.destination.parent.name, versions)
 
     # what's left is .url/.txt/.html/.nfo, samples and extracted archives
     if item.is_dir():

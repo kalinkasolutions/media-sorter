@@ -366,6 +366,42 @@ def test_another_release_of_a_movie_goes_next_to_the_one_in_the_library(library)
     assert not item.exists()
 
 
+def test_a_second_version_logs_a_duplicate_line_for_the_alert(library, caplog):
+    caplog.set_level("INFO")
+    existing = sorter.MOVIES / "Tornado (2025)" / "tornado.2025.720p.web.mkv"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"older version")
+    item = sorter.DOWNLOADS / "Tornado.2025.2160p.WEB"
+    download(f"{item.name}/tornado.2025.2160p.web.mkv")
+
+    sorter.file_into_library(item, sorter.plan(item))
+
+    assert "Duplicate: copied Tornado (2025), the folder now has 2 versions" in caplog.text
+
+
+def test_a_first_version_logs_no_duplicate(library, caplog):
+    caplog.set_level("INFO")
+    item = sorter.DOWNLOADS / "Tornado.2025.2160p.WEB"
+    download(f"{item.name}/tornado.2025.2160p.web.mkv")
+
+    sorter.file_into_library(item, sorter.plan(item))
+
+    assert "Duplicate" not in caplog.text
+
+
+def test_a_new_episode_next_to_other_episodes_is_no_duplicate(library, caplog):
+    caplog.set_level("INFO")
+    season = sorter.SERIES / "The Bear (2022)" / "Season 02"
+    season.mkdir(parents=True)
+    (season / "The Bear (2022) - S02E01.mkv").write_bytes(b"episode 1")
+    item = sorter.DOWNLOADS / "The.Bear.S02E02.1080p.WEB"
+    download(f"{item.name}/the.bear.s02e02.mkv")
+
+    sorter.file_into_library(item, sorter.plan(item))
+
+    assert "Duplicate" not in caplog.text
+
+
 def test_file_into_library_never_overwrites(library):
     item = sorter.DOWNLOADS / "Tornado.2025.1080p"
     download(f"{item.name}/tornado.mkv")
