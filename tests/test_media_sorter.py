@@ -1,6 +1,7 @@
 import io
 import json
 import re
+import signal
 import urllib.error
 
 import pytest
@@ -420,16 +421,61 @@ def test_failed_move_removes_the_partial_copy_and_keeps_the_download(library, mo
     item = sorter.DOWNLOADS / "Tornado.2025.1080p"
     video = download(f"{item.name}/tornado.mkv")
 
-    def disk_full(source, destination, copy_function):
+    def disk_full(source, destination):
         sorter.Path(destination).write_bytes(b"half")
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(sorter.shutil, "move", disk_full)
+    monkeypatch.setattr(sorter.shutil, "copyfile", disk_full)
     with pytest.raises(sorter.MoveFailed, match="No space left on device"):
         sorter.file_into_library(item, sorter.plan(item))
 
     assert library_files(library) == []
     assert video.exists()
+
+
+def test_stop_during_the_copy_leaves_nothing_in_the_library(library, monkeypatch):
+    item = sorter.DOWNLOADS / "Tornado.2025.1080p"
+    video = download(f"{item.name}/tornado.mkv")
+
+    def stopped_halfway(source, destination):
+        sorter.Path(destination).write_bytes(b"half")
+        sorter.stop(signal.SIGTERM, None)
+
+    monkeypatch.setattr(sorter.shutil, "copyfile", stopped_halfway)
+    with pytest.raises(SystemExit):
+        sorter.file_into_library(item, sorter.plan(item))
+
+    assert library_files(library) == []
+    assert video.exists()
+
+
+def test_a_partial_copy_left_by_a_kill_does_not_block_the_next_attempt(library):
+    item = sorter.DOWNLOADS / "Tornado.2025.1080p"
+    download(f"{item.name}/tornado.mkv")
+    leftover = sorter.MOVIES / "Tornado (2025)" / ".tornado.mkv.media-sorter.partial"
+    leftover.parent.mkdir(parents=True)
+    leftover.write_bytes(b"half")
+
+    sorter.file_into_library(item, sorter.plan(item))
+
+    assert library_files(library) == ["movies/Tornado (2025)/tornado.mkv"]
+    assert (sorter.MOVIES / "Tornado (2025)" / "tornado.mkv").read_bytes() == b"x" * 1000
+    assert not item.exists()
+
+
+def test_a_kill_after_the_copy_is_finished_on_the_next_attempt(library, caplog):
+    caplog.set_level("INFO")
+    item = sorter.DOWNLOADS / "Tornado.2025.1080p"
+    download(f"{item.name}/tornado.mkv")
+    copied = sorter.MOVIES / "Tornado (2025)" / "tornado.mkv"
+    copied.parent.mkdir(parents=True)
+    copied.write_bytes(b"x" * 1000)
+
+    sorter.file_into_library(item, sorter.plan(item))
+
+    assert library_files(library) == ["movies/Tornado (2025)/tornado.mkv"]
+    assert not item.exists()
+    assert "Already filed Tornado.2025.1080p/tornado.mkv" in caplog.text
 
 
 def test_failed_cleanup_still_counts_as_filed(library, monkeypatch, caplog):
@@ -551,10 +597,10 @@ def test_failed_move_is_logged_once(library, monkeypatch, caplog):
     monkeypatch.setattr(sorter, "SETTLE_SECONDS", 0)
     download("Tornado.2025.1080p/tornado.mkv")
 
-    def read_only(source, destination, copy_function):
+    def read_only(source, destination):
         raise OSError(30, "Read-only file system")
 
-    monkeypatch.setattr(sorter.shutil, "move", read_only)
+    monkeypatch.setattr(sorter.shutil, "copyfile", read_only)
     run_rounds(monkeypatch, rounds=4)
 
     assert caplog.text.count("Move failed for Tornado.2025.1080p") == 1

@@ -8,6 +8,7 @@ Anything that isn't a recognisable movie or episode is left where it is.
 """
 
 import contextlib
+import filecmp
 import functools
 import json
 import logging
@@ -45,6 +46,8 @@ VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".wmv"}
 UNFINISHED_SUFFIXES = {".part"}
 # a download folder containing this file is left alone; JDownloader needs the folder's name kept
 SKIP_MARKER = ".skip"
+# names an unfinished copy in the library, so a leftover from a killed container is plainly safe to delete
+PARTIAL_SUFFIX = ".media-sorter.partial"
 
 log = logging.getLogger("media-sorter")
 
@@ -55,6 +58,13 @@ run_now = False
 def request_run_now(signum, frame) -> None:
     global run_now
     run_now = True
+
+
+def stop(signum, frame) -> None:
+    # as PID 1 an unhandled SIGTERM is ignored and `docker stop` waits 10s for its SIGKILL;
+    # stopping mid-copy is safe, move_into_library only ever leaves a hidden *.media-sorter.partial behind
+    log.info("Stopping on %s", signal.Signals(signum).name)
+    raise SystemExit(0)
 
 
 @dataclass(frozen=True)
@@ -221,11 +231,36 @@ def plan_episode(video: Path, guess: dict) -> Placement:
     return Placement(video, season_folder / file_name, "show")
 
 
+def is_identical_copy(source: Path, destination: Path) -> bool:
+    return destination.is_file() and source.is_file() and filecmp.cmp(source, destination, shallow=False)
+
+
+def move_into_library(source: Path, destination: Path) -> None:
+    """Copies under a hidden name and renames it, so the library never holds a half-copied file under the real name."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(f".{destination.name}{PARTIAL_SUFFIX}")
+    try:
+        # copyfile, not copy2: the file should take the library's permissions and ACLs, not the download's
+        shutil.copyfile(source, partial)
+        partial.replace(destination)
+    finally:
+        with contextlib.suppress(OSError):
+            partial.unlink(missing_ok=True)
+    source.unlink()
+
+
 def file_into_library(item: Path, placements: list[Placement]) -> None:
     if DRY_RUN:
         for placement in placements:
             log.info("Would move %s -> %s", placement.source.relative_to(DOWNLOADS), shown(placement.destination))
         return
+
+    # a stop between the copy and deleting the download leaves an identical copy behind: finish that move
+    for placement in placements:
+        if is_identical_copy(placement.source, placement.destination):
+            placement.source.unlink()
+            log.info("Already filed %s -> %s, deleted the download", placement.source.relative_to(DOWNLOADS), shown(placement.destination))
+    placements = [placement for placement in placements if placement.source.exists()]
 
     clashes = [placement.destination for placement in placements if placement.destination.exists()]
     if clashes:
@@ -233,13 +268,8 @@ def file_into_library(item: Path, placements: list[Placement]) -> None:
 
     for placement in placements:
         try:
-            placement.destination.parent.mkdir(parents=True, exist_ok=True)
-            # copyfile, not copy2: the file should take the library's permissions and ACLs, not the download's
-            shutil.move(placement.source, placement.destination, copy_function=shutil.copyfile)
+            move_into_library(placement.source, placement.destination)
         except OSError as error:
-            # a half-copied file would look like it's already in the library on the next attempt
-            with contextlib.suppress(OSError):
-                placement.destination.unlink(missing_ok=True)
             raise MoveFailed(f"{placement.source.name} -> {shown(placement.destination)}: {error.strerror or error}")
         log.info("Moved %s -> %s", placement.source.relative_to(DOWNLOADS), shown(placement.destination))
         # only movies: a season folder holds other episodes, not other versions
@@ -375,5 +405,6 @@ if __name__ == "__main__":
     if not TMDB_KEY:
         raise SystemExit("TMDB_KEY is not set")
     signal.signal(signal.SIGUSR1, request_run_now)
+    signal.signal(signal.SIGTERM, stop)
     log.info(startup_message(len(list(DOWNLOADS.iterdir()))))
     watch()
