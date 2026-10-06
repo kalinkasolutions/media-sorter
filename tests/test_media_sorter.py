@@ -53,6 +53,8 @@ def library(tmp_path, monkeypatch):
     monkeypatch.setattr(sorter, "SERIES", tmp_path / "series")
     monkeypatch.setattr(sorter, "DRY_RUN", False)
     monkeypatch.setattr(sorter, "PLEX_URL", "")
+    for host_path in ("HOST_DOWNLOADS", "HOST_MOVIES", "HOST_SERIES"):
+        monkeypatch.setattr(sorter, host_path, "")
     monkeypatch.setattr(sorter, "run_now", False)
     monkeypatch.setattr(sorter, "tmdb_search", fake_tmdb_search)
     sorter.tmdb_lookup.cache_clear()
@@ -453,6 +455,83 @@ def test_failed_move_is_logged_once(library, monkeypatch, caplog):
 
     assert caplog.text.count("Move failed for Tornado.2025.1080p") == 1
     assert "Read-only file system" in caplog.text
+
+
+# Log lines
+
+
+@pytest.fixture
+def host_paths(monkeypatch):
+    monkeypatch.setattr(sorter, "HOST_DOWNLOADS", "/mnt/shared/jdownloader")
+    monkeypatch.setattr(sorter, "HOST_MOVIES", "/mnt/movies")
+    monkeypatch.setattr(sorter, "HOST_SERIES", "/mnt/series")
+
+
+def test_shown_names_paths_as_the_host_sees_them(host_paths):
+    assert sorter.shown(sorter.DOWNLOADS) == "/mnt/shared/jdownloader"
+    assert sorter.shown(sorter.MOVIES / "Tornado (2025)" / "t.mkv") == "/mnt/movies/Tornado (2025)/t.mkv"
+    assert sorter.shown(sorter.SERIES / "Elsbeth (2024)") == "/mnt/series/Elsbeth (2024)"
+
+
+def test_shown_keeps_the_container_path_without_host_paths():
+    assert sorter.shown(sorter.MOVIES / "Tornado (2025)") == str(sorter.MOVIES / "Tornado (2025)")
+
+
+def test_startup_message(host_paths, monkeypatch):
+    monkeypatch.setattr(sorter, "VERSION", "0.0.2")
+    monkeypatch.setattr(sorter, "POLL_SECONDS", 30)
+    monkeypatch.setattr(sorter, "SETTLE_SECONDS", 300)
+
+    assert sorter.startup_message(3) == (
+        "media-sorter 0.0.2: watching /mnt/shared/jdownloader (3 entries), checking every 30s, settle time 300s"
+    )
+    assert "(1 entry)" in sorter.startup_message(1)
+
+
+def test_moved_is_logged_after_the_move_with_the_host_path(library, host_paths, caplog):
+    caplog.set_level("INFO")
+    item = sorter.DOWNLOADS / "Tornado.2025.1080p"
+    download(f"{item.name}/tornado.mkv")
+
+    sorter.file_into_library(item, sorter.plan(item))
+
+    assert "Moved Tornado.2025.1080p/tornado.mkv -> /mnt/movies/Tornado (2025)/tornado.mkv" in caplog.text
+
+
+def test_dry_run_says_would_move(library, host_paths, monkeypatch, caplog):
+    caplog.set_level("INFO")
+    monkeypatch.setattr(sorter, "DRY_RUN", True)
+    item = sorter.DOWNLOADS / "Tornado.2025.1080p"
+    download(f"{item.name}/tornado.mkv")
+
+    sorter.file_into_library(item, sorter.plan(item))
+
+    assert "Would move Tornado.2025.1080p/tornado.mkv -> /mnt/movies/Tornado (2025)/tornado.mkv" in caplog.text
+    assert "Moved" not in caplog.text
+
+
+def test_nothing_is_logged_as_moved_when_it_is_already_in_the_library(library, host_paths, caplog):
+    caplog.set_level("INFO")
+    item = sorter.DOWNLOADS / "Tornado.2025.1080p"
+    download(f"{item.name}/tornado.mkv")
+    existing = sorter.MOVIES / "Tornado (2025)" / "tornado.mkv"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"already here")
+
+    with pytest.raises(sorter.NotRecognised, match=r"already in the library: /mnt/movies/Tornado \(2025\)/tornado.mkv"):
+        sorter.file_into_library(item, sorter.plan(item))
+
+    assert "Moved" not in caplog.text
+
+
+def test_unknown_movie_without_a_year_does_not_say_none(library):
+    item = sorter.DOWNLOADS / "Totally.Unknown.Film.1080p"
+    download(f"{item.name}/movie.mkv")
+
+    with pytest.raises(sorter.NotRecognised) as error:
+        sorter.plan(item)
+
+    assert str(error.value) == "TMDb has no movie 'Totally Unknown Film'"
 
 
 # Plex
