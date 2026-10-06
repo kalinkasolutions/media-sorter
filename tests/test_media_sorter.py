@@ -463,6 +463,19 @@ def test_a_partial_copy_left_by_a_kill_does_not_block_the_next_attempt(library):
     assert not item.exists()
 
 
+def test_copying_into_a_folder_deletes_partial_copies_of_other_files(library):
+    item = sorter.DOWNLOADS / "Tornado.2025.1080p"
+    download(f"{item.name}/tornado.mkv")
+    folder = sorter.MOVIES / "Tornado (2025)"
+    folder.mkdir(parents=True)
+    (folder / ".tornado.2160p.mkv.media-sorter.partial").write_bytes(b"half")
+    (folder / ".tornado.nfo").write_bytes(b"not ours")
+
+    sorter.file_into_library(item, sorter.plan(item))
+
+    assert sorted(path.name for path in folder.iterdir()) == [".tornado.nfo", "tornado.mkv"]
+
+
 def test_a_kill_after_the_copy_is_finished_on_the_next_attempt(library, caplog):
     caplog.set_level("INFO")
     item = sorter.DOWNLOADS / "Tornado.2025.1080p"

@@ -238,6 +238,9 @@ def is_identical_copy(source: Path, destination: Path) -> bool:
 def move_into_library(source: Path, destination: Path) -> None:
     """Copies under a hidden name and renames it, so the library never holds a half-copied file under the real name."""
     destination.parent.mkdir(parents=True, exist_ok=True)
+    # leftovers of a killed container; only one copy is ever in flight, so none of them is still being written
+    for leftover in destination.parent.glob(f".*{PARTIAL_SUFFIX}"):
+        leftover.unlink(missing_ok=True)
     partial = destination.with_name(f".{destination.name}{PARTIAL_SUFFIX}")
     try:
         # copyfile, not copy2: the file should take the library's permissions and ACLs, not the download's
