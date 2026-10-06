@@ -402,6 +402,32 @@ def test_trigger_skips_the_settle_time(library, monkeypatch):
     assert library_files(library) == ["movies/Tornado (2025)/tornado.mkv"]
 
 
+def test_skip_marker_keeps_a_download_out_until_it_is_deleted(library, monkeypatch, caplog):
+    caplog.set_level("INFO")
+    monkeypatch.setattr(sorter, "SETTLE_SECONDS", 0)
+    download("Tornado.2025.1080p/tornado.mkv")
+    marker = download("Tornado.2025.1080p/.skip", size=0)
+
+    def delete_marker_after_round_three(round_number):
+        if round_number == 4:
+            marker.unlink()
+
+    run_rounds(monkeypatch, rounds=6, before_round=delete_marker_after_round_three)
+
+    assert caplog.text.count("Skipping Tornado.2025.1080p: it has a .skip file") == 1
+    assert library_files(library) == ["movies/Tornado (2025)/tornado.mkv"]
+
+
+def test_skip_marker_keeps_a_settled_download_in_place(library, monkeypatch):
+    monkeypatch.setattr(sorter, "SETTLE_SECONDS", 0)
+    download("Tornado.2025.1080p/tornado.mkv")
+    download("Tornado.2025.1080p/.skip", size=0)
+
+    run_rounds(monkeypatch, rounds=4)
+
+    assert library_files(library) == []
+
+
 def test_unrecognised_download_is_reported_once_and_retried_after_a_trigger(library, monkeypatch, caplog):
     monkeypatch.setattr(sorter, "SETTLE_SECONDS", 0)
     download("Games/setup.exe")

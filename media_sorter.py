@@ -39,6 +39,8 @@ SETTLE_SECONDS = int(os.environ.get("SETTLE_SECONDS", "0" if DRY_RUN else "300")
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".wmv"}
 # JDownloader's in-progress downloads
 UNFINISHED_SUFFIXES = {".part"}
+# a download folder containing this file is left alone; JDownloader needs the folder's name kept
+SKIP_MARKER = ".skip"
 
 log = logging.getLogger("media-sorter")
 
@@ -270,6 +272,11 @@ def watch() -> None:
             except FileNotFoundError:
                 continue
             if skipped.get(item) == current:
+                continue
+            if (item / SKIP_MARKER).exists():
+                log.info("Skipping %s: it has a %s file", item.name, SKIP_MARKER)
+                # deleting the marker changes the snapshot, which makes it a candidate again
+                skipped[item] = current
                 continue
 
             seen = first_seen_unchanged.get(item)
