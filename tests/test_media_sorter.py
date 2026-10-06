@@ -349,6 +349,23 @@ def test_file_into_library_in_a_dry_run_moves_nothing(library, monkeypatch):
     assert library_files(library) == []
 
 
+def test_another_release_of_a_movie_goes_next_to_the_one_in_the_library(library):
+    existing = sorter.MOVIES / "Tornado (2025)" / "tornado.2025.720p.web.mkv"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"older version")
+    item = sorter.DOWNLOADS / "Tornado.2025.2160p.WEB"
+    download(f"{item.name}/tornado.2025.2160p.web.mkv")
+
+    sorter.file_into_library(item, sorter.plan(item))
+
+    assert library_files(library) == [
+        "movies/Tornado (2025)/tornado.2025.2160p.web.mkv",
+        "movies/Tornado (2025)/tornado.2025.720p.web.mkv",
+    ]
+    assert existing.read_bytes() == b"older version"
+    assert not item.exists()
+
+
 def test_file_into_library_never_overwrites(library):
     item = sorter.DOWNLOADS / "Tornado.2025.1080p"
     download(f"{item.name}/tornado.mkv")
