@@ -8,6 +8,7 @@ Anything that isn't a recognisable movie or episode is left where it is.
 """
 
 import contextlib
+import filecmp
 import functools
 import json
 import logging
@@ -45,6 +46,8 @@ VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".wmv"}
 UNFINISHED_SUFFIXES = {".part"}
 # a download folder containing this file is left alone; JDownloader needs the folder's name kept
 SKIP_MARKER = ".skip"
+# names an unfinished copy in the library, so a leftover from a killed container is plainly safe to delete
+PARTIAL_SUFFIX = ".media-sorter.partial"
 
 log = logging.getLogger("media-sorter")
 
@@ -55,6 +58,13 @@ run_now = False
 def request_run_now(signum, frame) -> None:
     global run_now
     run_now = True
+
+
+def stop(signum, frame) -> None:
+    # as PID 1 an unhandled SIGTERM is ignored and `docker stop` waits 10s for its SIGKILL;
+    # stopping mid-copy is safe, move_into_library only ever leaves a hidden *.media-sorter.partial behind
+    log.info("Stopping on %s", signal.Signals(signum).name)
+    raise SystemExit(0)
 
 
 @dataclass(frozen=True)
@@ -104,8 +114,26 @@ def shown(path: Path) -> str:
 
 
 def safe_filename(name: str) -> str:
-    name = name.replace(": ", " - ")
-    return re.sub(r'[<>:"/\\|?*]', "", name).strip(" .")
+    # a colon becomes a space, as in the existing library: "2001 A Space Odyssey (1968)", "2 22 (2017)"
+    name = re.sub(r'[<>:"/\\|?*]', lambda match: " " if match.group() == ":" else "", name)
+    return re.sub(r"\s+", " ", name).strip(" .")
+
+
+def folder_key(name: str) -> str:
+    # letters and digits only, so "gibt's" matches "gibts" and "Spider-Man" matches "Spiderman"
+    return "".join(re.findall(r"[^\W_]+", name.casefold()))
+
+
+def library_folder(library: Path, name: str) -> Path:
+    """The folder for name, reusing one that is only spelled differently, like "2 22 (2017)" for "2:22 (2017)"."""
+    if (library / name).is_dir():
+        return library / name
+    wanted = folder_key(name)
+    if library.is_dir():
+        for existing in library.iterdir():
+            if existing.is_dir() and folder_key(existing.name) == wanted:
+                return existing
+    return library / name
 
 
 def episode_code(season: int, episode: int | list[int]) -> str:
@@ -187,7 +215,7 @@ def plan_movie(video: Path, guess: dict) -> Placement:
     if not name:
         year = f" ({guess['year']})" if guess.get("year") else ""
         raise NotRecognised(f"TMDb has no movie '{guess['title']}'{year}")
-    return Placement(video, MOVIES / name / video.name, "movie")
+    return Placement(video, library_folder(MOVIES, name) / video.name, "movie")
 
 
 def plan_episode(video: Path, guess: dict) -> Placement:
@@ -198,9 +226,30 @@ def plan_episode(video: Path, guess: dict) -> Placement:
     show = tmdb_lookup("tv", guess["title"], guess.get("year"))
     if not show:
         raise NotRecognised(f"TMDb has no series '{guess['title']}'")
-    season_folder = SERIES / show / f"Season {guess['season']:02}"
+    season_folder = library_folder(SERIES, show) / f"Season {guess['season']:02}"
     file_name = f"{show} - {episode_code(guess['season'], guess['episode'])}{video.suffix.lower()}"
     return Placement(video, season_folder / file_name, "show")
+
+
+def is_identical_copy(source: Path, destination: Path) -> bool:
+    return destination.is_file() and source.is_file() and filecmp.cmp(source, destination, shallow=False)
+
+
+def move_into_library(source: Path, destination: Path) -> None:
+    """Copies under a hidden name and renames it, so the library never holds a half-copied file under the real name."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # leftovers of a killed container; only one copy is ever in flight, so none of them is still being written
+    for leftover in destination.parent.glob(f".*{PARTIAL_SUFFIX}"):
+        leftover.unlink(missing_ok=True)
+    partial = destination.with_name(f".{destination.name}{PARTIAL_SUFFIX}")
+    try:
+        # copyfile, not copy2: the file should take the library's permissions and ACLs, not the download's
+        shutil.copyfile(source, partial)
+        partial.replace(destination)
+    finally:
+        with contextlib.suppress(OSError):
+            partial.unlink(missing_ok=True)
+    source.unlink()
 
 
 def file_into_library(item: Path, placements: list[Placement]) -> None:
@@ -209,21 +258,29 @@ def file_into_library(item: Path, placements: list[Placement]) -> None:
             log.info("Would move %s -> %s", placement.source.relative_to(DOWNLOADS), shown(placement.destination))
         return
 
+    # a stop between the copy and deleting the download leaves an identical copy behind: finish that move
+    for placement in placements:
+        if is_identical_copy(placement.source, placement.destination):
+            placement.source.unlink()
+            log.info("Already filed %s -> %s, deleted the download", placement.source.relative_to(DOWNLOADS), shown(placement.destination))
+    placements = [placement for placement in placements if placement.source.exists()]
+
     clashes = [placement.destination for placement in placements if placement.destination.exists()]
     if clashes:
         raise NotRecognised(f"already in the library: {', '.join(map(shown, clashes))}")
 
     for placement in placements:
         try:
-            placement.destination.parent.mkdir(parents=True, exist_ok=True)
-            # copyfile, not copy2: the file should take the library's permissions and ACLs, not the download's
-            shutil.move(placement.source, placement.destination, copy_function=shutil.copyfile)
+            move_into_library(placement.source, placement.destination)
         except OSError as error:
-            # a half-copied file would look like it's already in the library on the next attempt
-            with contextlib.suppress(OSError):
-                placement.destination.unlink(missing_ok=True)
             raise MoveFailed(f"{placement.source.name} -> {shown(placement.destination)}: {error.strerror or error}")
         log.info("Moved %s -> %s", placement.source.relative_to(DOWNLOADS), shown(placement.destination))
+        # only movies: a season folder holds other episodes, not other versions
+        if placement.plex_type == "movie":
+            versions = len(videos_in(placement.destination.parent))
+            if versions > 1:
+                # the Grafana alert "media-sorter duplicate" matches this wording; change both together
+                log.info("Duplicate: copied %s, the folder now has %d versions", placement.destination.parent.name, versions)
 
     # what's left is .url/.txt/.html/.nfo, samples and extracted archives
     if item.is_dir():
@@ -351,5 +408,6 @@ if __name__ == "__main__":
     if not TMDB_KEY:
         raise SystemExit("TMDB_KEY is not set")
     signal.signal(signal.SIGUSR1, request_run_now)
+    signal.signal(signal.SIGTERM, stop)
     log.info(startup_message(len(list(DOWNLOADS.iterdir()))))
     watch()

@@ -1,6 +1,7 @@
 import io
 import json
 import re
+import signal
 import urllib.error
 
 import pytest
@@ -18,6 +19,9 @@ CATALOGUE = {
         {"title": "Dune: Part Two", "release_date": "2024-02-27"},
         {"title": "Dune", "release_date": "2021-09-15"},
         {"title": "Schreiner", "release_date": "2011-01-01"},
+        {"title": "2001: A Space Odyssey", "release_date": "1968-04-02"},
+        {"title": "13 Hours: The Secret Soldiers of Benghazi", "release_date": "2016-01-13"},
+        {"title": "28 Years Later: The Bone Temple", "release_date": "2026-01-14"},
     ],
     "tv": [
         {"name": "Elsbeth", "first_air_date": "2024-02-29"},
@@ -99,12 +103,14 @@ def run_rounds(monkeypatch, rounds: int, before_round=None) -> list[set[str]]:
 
 
 @pytest.mark.parametrize("name, expected", [
-    ("Mission: Impossible (1996)", "Mission - Impossible (1996)"),
+    ("Mission: Impossible (1996)", "Mission Impossible (1996)"),
+    ("2:22 (2017)", "2 22 (2017)"),
+    ("13 Hours: The Secret Soldiers of Benghazi (2016)", "13 Hours The Secret Soldiers of Benghazi (2016)"),
     ('What? A "Movie" (2020)', "What A Movie (2020)"),
     ("AC/DC Live (1991)", "ACDC Live (1991)"),
     ("Trailing dot.", "Trailing dot"),
 ])
-def test_safe_filename_drops_characters_windows_and_plex_trip_over(name, expected):
+def test_safe_filename_follows_the_library_and_drops_characters_windows_trips_over(name, expected):
     assert sorter.safe_filename(name) == expected
 
 
@@ -126,6 +132,21 @@ def test_with_umlauts():
 ])
 def test_is_sample(path, expected):
     assert sorter.is_sample(sorter.Path(path)) == expected
+
+
+@pytest.mark.parametrize("a, b", [
+    ("2 22 (2017)", "2:22 (2017)"),
+    ("28 Years Later: The Bone Temple (2026)", "28 Years Later The Bone Temple (2026)"),
+    ("Zum Glück gibts Schreiner (2020)", "Zum Glück gibt's Schreiner (2020)"),
+    ("Spiderman (2002)", "Spider-Man (2002)"),
+    ("the bear (2022)", "The Bear (2022)"),
+])
+def test_folder_key_ignores_spelling(a, b):
+    assert sorter.folder_key(a) == sorter.folder_key(b)
+
+
+def test_folder_key_keeps_the_year_apart():
+    assert sorter.folder_key("Dune (1984)") != sorter.folder_key("Dune (2021)")
 
 
 # TMDb search
@@ -161,7 +182,7 @@ def test_tmdb_lookup_falls_back_to_no_year_when_the_year_is_off():
 
 
 def test_tmdb_lookup_makes_the_name_safe_for_a_folder():
-    assert sorter.tmdb_lookup("movie", "Dune Part Two", 2024) == "Dune - Part Two (2024)"
+    assert sorter.tmdb_lookup("movie", "Dune Part Two", 2024) == "Dune Part Two (2024)"
 
 
 def test_tmdb_lookup_for_series():
@@ -233,7 +254,7 @@ def test_plan_movie_with_a_part_in_its_title(library):
     item = sorter.DOWNLOADS / "Dune.Part.Two.2024.1080p.WEB-DL.x265-GRP"
     video = download(f"{item.name}/movie.mkv")
 
-    assert sorter.plan(item)[0].destination == sorter.MOVIES / "Dune - Part Two (2024)" / "movie.mkv"
+    assert sorter.plan(item)[0].destination == sorter.MOVIES / "Dune Part Two (2024)" / "movie.mkv"
 
 
 def test_plan_season_pack_puts_every_episode_into_its_season_folder(library):
@@ -270,6 +291,37 @@ def test_plan_leaves_a_movie_tmdb_does_not_know(library):
         sorter.plan(item)
 
 
+@pytest.mark.parametrize("existing, release", [
+    ("2001 A Space Odyssey (1968)", "2001.A.Space.Odyssey.1968.1080p.BluRay"),
+    ("13 Hours The Secret Soldiers of Benghazi (2016)", "13.Hours.The.Secret.Soldiers.of.Benghazi.2016.1080p.BluRay"),
+    ("28 Years Later: The Bone Temple (2026)", "28.Years.Later.The.Bone.Temple.2026.1080p.WEB"),
+])
+def test_plan_movie_reuses_the_existing_folder_even_when_spelled_differently(library, existing, release):
+    (sorter.MOVIES / existing).mkdir()
+    item = sorter.DOWNLOADS / release
+    download(f"{release}/movie.mkv")
+
+    assert sorter.plan(item)[0].destination == sorter.MOVIES / existing / "movie.mkv"
+
+
+def test_plan_movie_does_not_reuse_a_folder_of_another_year(library):
+    (sorter.MOVIES / "Dune (1984)").mkdir()
+    item = sorter.DOWNLOADS / "Dune.2021.1080p.WEB"
+    download(f"{item.name}/movie.mkv")
+
+    assert sorter.plan(item)[0].destination == sorter.MOVIES / "Dune (2021)" / "movie.mkv"
+
+
+def test_plan_episode_puts_a_new_season_into_the_existing_show_folder(library):
+    (sorter.SERIES / "the bear (2022)" / "Season 01").mkdir(parents=True)
+    item = sorter.DOWNLOADS / "The.Bear.S02E01.1080p.WEB"
+    download(f"{item.name}/the.bear.s02e01.mkv")
+
+    assert sorter.plan(item)[0].destination == (
+        sorter.SERIES / "the bear (2022)" / "Season 02" / "The Bear (2022) - S02E01.mkv"
+    )
+
+
 # Moving
 
 
@@ -298,6 +350,59 @@ def test_file_into_library_in_a_dry_run_moves_nothing(library, monkeypatch):
     assert library_files(library) == []
 
 
+def test_another_release_of_a_movie_goes_next_to_the_one_in_the_library(library):
+    existing = sorter.MOVIES / "Tornado (2025)" / "tornado.2025.720p.web.mkv"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"older version")
+    item = sorter.DOWNLOADS / "Tornado.2025.2160p.WEB"
+    download(f"{item.name}/tornado.2025.2160p.web.mkv")
+
+    sorter.file_into_library(item, sorter.plan(item))
+
+    assert library_files(library) == [
+        "movies/Tornado (2025)/tornado.2025.2160p.web.mkv",
+        "movies/Tornado (2025)/tornado.2025.720p.web.mkv",
+    ]
+    assert existing.read_bytes() == b"older version"
+    assert not item.exists()
+
+
+def test_a_second_version_logs_a_duplicate_line_for_the_alert(library, caplog):
+    caplog.set_level("INFO")
+    existing = sorter.MOVIES / "Tornado (2025)" / "tornado.2025.720p.web.mkv"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"older version")
+    item = sorter.DOWNLOADS / "Tornado.2025.2160p.WEB"
+    download(f"{item.name}/tornado.2025.2160p.web.mkv")
+
+    sorter.file_into_library(item, sorter.plan(item))
+
+    assert "Duplicate: copied Tornado (2025), the folder now has 2 versions" in caplog.text
+
+
+def test_a_first_version_logs_no_duplicate(library, caplog):
+    caplog.set_level("INFO")
+    item = sorter.DOWNLOADS / "Tornado.2025.2160p.WEB"
+    download(f"{item.name}/tornado.2025.2160p.web.mkv")
+
+    sorter.file_into_library(item, sorter.plan(item))
+
+    assert "Duplicate" not in caplog.text
+
+
+def test_a_new_episode_next_to_other_episodes_is_no_duplicate(library, caplog):
+    caplog.set_level("INFO")
+    season = sorter.SERIES / "The Bear (2022)" / "Season 02"
+    season.mkdir(parents=True)
+    (season / "The Bear (2022) - S02E01.mkv").write_bytes(b"episode 1")
+    item = sorter.DOWNLOADS / "The.Bear.S02E02.1080p.WEB"
+    download(f"{item.name}/the.bear.s02e02.mkv")
+
+    sorter.file_into_library(item, sorter.plan(item))
+
+    assert "Duplicate" not in caplog.text
+
+
 def test_file_into_library_never_overwrites(library):
     item = sorter.DOWNLOADS / "Tornado.2025.1080p"
     download(f"{item.name}/tornado.mkv")
@@ -316,16 +421,74 @@ def test_failed_move_removes_the_partial_copy_and_keeps_the_download(library, mo
     item = sorter.DOWNLOADS / "Tornado.2025.1080p"
     video = download(f"{item.name}/tornado.mkv")
 
-    def disk_full(source, destination, copy_function):
+    def disk_full(source, destination):
         sorter.Path(destination).write_bytes(b"half")
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(sorter.shutil, "move", disk_full)
+    monkeypatch.setattr(sorter.shutil, "copyfile", disk_full)
     with pytest.raises(sorter.MoveFailed, match="No space left on device"):
         sorter.file_into_library(item, sorter.plan(item))
 
     assert library_files(library) == []
     assert video.exists()
+
+
+def test_stop_during_the_copy_leaves_nothing_in_the_library(library, monkeypatch):
+    item = sorter.DOWNLOADS / "Tornado.2025.1080p"
+    video = download(f"{item.name}/tornado.mkv")
+
+    def stopped_halfway(source, destination):
+        sorter.Path(destination).write_bytes(b"half")
+        sorter.stop(signal.SIGTERM, None)
+
+    monkeypatch.setattr(sorter.shutil, "copyfile", stopped_halfway)
+    with pytest.raises(SystemExit):
+        sorter.file_into_library(item, sorter.plan(item))
+
+    assert library_files(library) == []
+    assert video.exists()
+
+
+def test_a_partial_copy_left_by_a_kill_does_not_block_the_next_attempt(library):
+    item = sorter.DOWNLOADS / "Tornado.2025.1080p"
+    download(f"{item.name}/tornado.mkv")
+    leftover = sorter.MOVIES / "Tornado (2025)" / ".tornado.mkv.media-sorter.partial"
+    leftover.parent.mkdir(parents=True)
+    leftover.write_bytes(b"half")
+
+    sorter.file_into_library(item, sorter.plan(item))
+
+    assert library_files(library) == ["movies/Tornado (2025)/tornado.mkv"]
+    assert (sorter.MOVIES / "Tornado (2025)" / "tornado.mkv").read_bytes() == b"x" * 1000
+    assert not item.exists()
+
+
+def test_copying_into_a_folder_deletes_partial_copies_of_other_files(library):
+    item = sorter.DOWNLOADS / "Tornado.2025.1080p"
+    download(f"{item.name}/tornado.mkv")
+    folder = sorter.MOVIES / "Tornado (2025)"
+    folder.mkdir(parents=True)
+    (folder / ".tornado.2160p.mkv.media-sorter.partial").write_bytes(b"half")
+    (folder / ".tornado.nfo").write_bytes(b"not ours")
+
+    sorter.file_into_library(item, sorter.plan(item))
+
+    assert sorted(path.name for path in folder.iterdir()) == [".tornado.nfo", "tornado.mkv"]
+
+
+def test_a_kill_after_the_copy_is_finished_on_the_next_attempt(library, caplog):
+    caplog.set_level("INFO")
+    item = sorter.DOWNLOADS / "Tornado.2025.1080p"
+    download(f"{item.name}/tornado.mkv")
+    copied = sorter.MOVIES / "Tornado (2025)" / "tornado.mkv"
+    copied.parent.mkdir(parents=True)
+    copied.write_bytes(b"x" * 1000)
+
+    sorter.file_into_library(item, sorter.plan(item))
+
+    assert library_files(library) == ["movies/Tornado (2025)/tornado.mkv"]
+    assert not item.exists()
+    assert "Already filed Tornado.2025.1080p/tornado.mkv" in caplog.text
 
 
 def test_failed_cleanup_still_counts_as_filed(library, monkeypatch, caplog):
@@ -447,10 +610,10 @@ def test_failed_move_is_logged_once(library, monkeypatch, caplog):
     monkeypatch.setattr(sorter, "SETTLE_SECONDS", 0)
     download("Tornado.2025.1080p/tornado.mkv")
 
-    def read_only(source, destination, copy_function):
+    def read_only(source, destination):
         raise OSError(30, "Read-only file system")
 
-    monkeypatch.setattr(sorter.shutil, "move", read_only)
+    monkeypatch.setattr(sorter.shutil, "copyfile", read_only)
     run_rounds(monkeypatch, rounds=4)
 
     assert caplog.text.count("Move failed for Tornado.2025.1080p") == 1
