@@ -6,6 +6,11 @@ services:
     env_file: media-sorter.env
     # the shares are group storage with no access for others; STORAGE_GID is `getent group storage`
     user: "${PUID:-1000}:${STORAGE_GID:?set STORAGE_GID in .env}"
+    environment:
+      # only for the log, so it names the folders as they are on this host
+      HOST_DOWNLOADS: ${DOWNLOADS_PATH:-/mnt/shared/jdownloader}
+      HOST_MOVIES: ${MOVIES_PATH:-/mnt/movies}
+      HOST_SERIES: ${SERIES_PATH:-/mnt/series}
     volumes:
       - ${DOWNLOADS_PATH:-/mnt/shared/jdownloader}:/downloads
       # autofs mounts, so the container needs to see them mounted after it started

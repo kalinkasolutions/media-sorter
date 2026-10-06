@@ -28,6 +28,10 @@ VERSION = os.environ.get("VERSION", "dev")
 DOWNLOADS = Path(os.environ.get("DOWNLOADS", "/mnt/shared"))
 MOVIES = Path(os.environ.get("MOVIES", "/storage/movies"))
 SERIES = Path(os.environ.get("SERIES", "/storage/series"))
+# the same folders as the host sees them, only for the log; compose passes them in
+HOST_DOWNLOADS = os.environ.get("HOST_DOWNLOADS", "")
+HOST_MOVIES = os.environ.get("HOST_MOVIES", "")
+HOST_SERIES = os.environ.get("HOST_SERIES", "")
 TMDB_KEY = os.environ.get("TMDB_KEY", "")
 PLEX_URL = os.environ.get("PLEX_URL", "").rstrip("/")
 PLEX_TOKEN = os.environ.get("PLEX_TOKEN", "")
@@ -90,6 +94,13 @@ def is_sample(path: Path) -> bool:
 def videos_in(item: Path) -> list[Path]:
     videos = [path for path in files_in(item) if path.suffix.lower() in VIDEO_EXTENSIONS and not is_sample(path)]
     return sorted(videos, key=lambda path: path.stat().st_size, reverse=True)
+
+
+def shown(path: Path) -> str:
+    for root, host_root in ((DOWNLOADS, HOST_DOWNLOADS), (MOVIES, HOST_MOVIES), (SERIES, HOST_SERIES)):
+        if host_root and path.is_relative_to(root):
+            return str(Path(host_root) / path.relative_to(root))
+    return str(path)
 
 
 def safe_filename(name: str) -> str:
@@ -174,7 +185,8 @@ def plan_movie(video: Path, guess: dict) -> Placement:
     queries = [f"{guess['title']} Part {guess['part']}", guess["title"]] if "part" in guess else [guess["title"]]
     name = next(filter(None, (tmdb_lookup("movie", query, guess.get("year")) for query in queries)), None)
     if not name:
-        raise NotRecognised(f"TMDb has no movie '{guess['title']}' ({guess.get('year')})")
+        year = f" ({guess['year']})" if guess.get("year") else ""
+        raise NotRecognised(f"TMDb has no movie '{guess['title']}'{year}")
     return Placement(video, MOVIES / name / video.name, "movie")
 
 
@@ -192,14 +204,14 @@ def plan_episode(video: Path, guess: dict) -> Placement:
 
 
 def file_into_library(item: Path, placements: list[Placement]) -> None:
-    for placement in placements:
-        log.info("%s -> %s", placement.source.relative_to(DOWNLOADS), placement.destination)
     if DRY_RUN:
+        for placement in placements:
+            log.info("Would move %s -> %s", placement.source.relative_to(DOWNLOADS), shown(placement.destination))
         return
 
     clashes = [placement.destination for placement in placements if placement.destination.exists()]
     if clashes:
-        raise NotRecognised(f"already in the library: {', '.join(map(str, clashes))}")
+        raise NotRecognised(f"already in the library: {', '.join(map(shown, clashes))}")
 
     for placement in placements:
         try:
@@ -210,7 +222,8 @@ def file_into_library(item: Path, placements: list[Placement]) -> None:
             # a half-copied file would look like it's already in the library on the next attempt
             with contextlib.suppress(OSError):
                 placement.destination.unlink(missing_ok=True)
-            raise MoveFailed(f"{placement.source.name} -> {placement.destination}: {error.strerror or error}")
+            raise MoveFailed(f"{placement.source.name} -> {shown(placement.destination)}: {error.strerror or error}")
+        log.info("Moved %s -> %s", placement.source.relative_to(DOWNLOADS), shown(placement.destination))
 
     # what's left is .url/.txt/.html/.nfo, samples and extracted archives
     if item.is_dir():
@@ -245,6 +258,14 @@ def sleep_until_next_poll() -> None:
         if run_now:
             return
         time.sleep(1)
+
+
+def startup_message(entries: int) -> str:
+    return (
+        f"media-sorter {VERSION}{' (dry run)' if DRY_RUN else ''}: watching {shown(DOWNLOADS)} "
+        f"({entries} {'entry' if entries == 1 else 'entries'}), "
+        f"checking every {POLL_SECONDS}s, settle time {SETTLE_SECONDS}s"
+    )
 
 
 def watch() -> None:
@@ -330,9 +351,5 @@ if __name__ == "__main__":
     if not TMDB_KEY:
         raise SystemExit("TMDB_KEY is not set")
     signal.signal(signal.SIGUSR1, request_run_now)
-    log.info(
-        "media-sorter %s%s: watching %s (%d entries), checking every %ds, settle time %ds",
-        VERSION, " (dry run)" if DRY_RUN else "", DOWNLOADS,
-        len(list(DOWNLOADS.iterdir())), POLL_SECONDS, SETTLE_SECONDS,
-    )
+    log.info(startup_message(len(list(DOWNLOADS.iterdir()))))
     watch()
