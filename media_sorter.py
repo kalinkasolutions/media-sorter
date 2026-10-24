@@ -2,7 +2,7 @@
 """Watches the download folder and files finished movies and series into the Plex libraries.
 
 Movies:  MOVIES/Title (Year)/<original file name>
-Series:  SERIES/Show (Year)/Season 01/Show (Year) - S01E02.mkv
+Series:  SERIES/Show (Year)/season_01/Show (Year) - S01E02.mkv
 
 Anything that isn't a recognisable movie or episode is left where it is.
 """
@@ -74,6 +74,12 @@ class Placement:
     plex_type: str  # Plex's section type: "movie" or "show"
 
 
+@dataclass(frozen=True)
+class TmdbMatch:
+    name: str  # "Title (Year)", safe as a folder name
+    id: int
+
+
 class NotRecognised(Exception):
     pass
 
@@ -124,16 +130,50 @@ def folder_key(name: str) -> str:
     return "".join(re.findall(r"[^\W_]+", name.casefold()))
 
 
-def library_folder(library: Path, name: str) -> Path:
-    """The folder for name, reusing one that is only spelled differently, like "2 22 (2017)" for "2:22 (2017)"."""
-    if (library / name).is_dir():
-        return library / name
-    wanted = folder_key(name)
-    if library.is_dir():
-        for existing in library.iterdir():
-            if existing.is_dir() and folder_key(existing.name) == wanted:
+def without_year(name: str) -> str:
+    return re.sub(r"\s*\(\d{4}\)$", "", name)
+
+
+def tmdb_id_in(folder_name: str) -> int | None:
+    tag = re.search(r"\{tmdb-(\d+)\}", folder_name)
+    return int(tag[1]) if tag else None
+
+
+def library_folder(library: Path, kind: str, match: TmdbMatch) -> Path:
+    """The folder for match, reusing one tagged with its TMDb id like "Scrubs (2001) {tmdb-4556}",
+    one only spelled differently like "2 22 (2017)", or one without the year that TMDb takes for the same title."""
+    if (library / match.name).is_dir():
+        return library / match.name
+    folders = [path for path in library.iterdir() if path.is_dir()] if library.is_dir() else []
+    untagged = []
+    for folder in folders:
+        folder_id = tmdb_id_in(folder.name)
+        if folder_id == match.id:
+            return folder
+        if folder_id is None:
+            untagged.append(folder)
+    for folder in untagged:
+        if folder_key(folder.name) == folder_key(match.name):
+            return folder
+    # a bare "Scrubs" holds whichever show TMDb finds first for that name, so it gets only that show's episodes
+    for folder in untagged:
+        if folder_key(folder.name) == folder_key(without_year(match.name)) and tmdb_lookup(kind, folder.name, None) == match:
+            return folder
+    return library / match.name
+
+
+def season_number_in(folder_name: str) -> int | None:
+    found = re.fullmatch(r"season[ _.-]*(\d+)", folder_name, re.IGNORECASE)
+    return int(found[1]) if found else None
+
+
+def season_folder(show_folder: Path, season: int) -> Path:
+    """The show's folder for season, reusing one spelled differently, like "Season 4" for "season_04"."""
+    if show_folder.is_dir():
+        for existing in sorted(show_folder.iterdir()):
+            if existing.is_dir() and season_number_in(existing.name) == season:
                 return existing
-    return library / name
+    return show_folder / f"season_{season:02}"
 
 
 def episode_code(season: int, episode: int | list[int]) -> str:
@@ -176,8 +216,8 @@ def search_attempts(title: str, year: int | None) -> list[tuple[str, int | None]
 
 
 @functools.cache
-def tmdb_lookup(kind: str, title: str, year: int | None) -> str | None:
-    """Returns the canonical "Title (Year)" for a movie or tv show, or None if TMDb doesn't know it."""
+def tmdb_lookup(kind: str, title: str, year: int | None) -> TmdbMatch | None:
+    """Returns the canonical "Title (Year)" and id of a movie or tv show, or None if TMDb doesn't know it."""
     year_param = "year" if kind == "movie" else "first_air_date_year"
     for query, year_filter in search_attempts(title, year):
         params = {"query": query}
@@ -188,7 +228,7 @@ def tmdb_lookup(kind: str, title: str, year: int | None) -> str | None:
             best = results[0]
             name = best["title"] if kind == "movie" else best["name"]
             date = best.get("release_date" if kind == "movie" else "first_air_date") or ""
-            return safe_filename(f"{name} ({date[:4]})" if date else name)
+            return TmdbMatch(safe_filename(f"{name} ({date[:4]})" if date else name), best["id"])
     return None
 
 
@@ -211,11 +251,11 @@ def plan_movie(video: Path, guess: dict) -> Placement:
         raise NotRecognised(f"no title in {video.name}")
     # guessit splits "Dune.Part.Two" into title "Dune" and part 2
     queries = [f"{guess['title']} Part {guess['part']}", guess["title"]] if "part" in guess else [guess["title"]]
-    name = next(filter(None, (tmdb_lookup("movie", query, guess.get("year")) for query in queries)), None)
-    if not name:
+    match = next(filter(None, (tmdb_lookup("movie", query, guess.get("year")) for query in queries)), None)
+    if not match:
         year = f" ({guess['year']})" if guess.get("year") else ""
         raise NotRecognised(f"TMDb has no movie '{guess['title']}'{year}")
-    return Placement(video, library_folder(MOVIES, name) / video.name, "movie")
+    return Placement(video, library_folder(MOVIES, "movie", match) / video.name, "movie")
 
 
 def plan_episode(video: Path, guess: dict) -> Placement:
@@ -226,9 +266,9 @@ def plan_episode(video: Path, guess: dict) -> Placement:
     show = tmdb_lookup("tv", guess["title"], guess.get("year"))
     if not show:
         raise NotRecognised(f"TMDb has no series '{guess['title']}'")
-    season_folder = library_folder(SERIES, show) / f"Season {guess['season']:02}"
-    file_name = f"{show} - {episode_code(guess['season'], guess['episode'])}{video.suffix.lower()}"
-    return Placement(video, season_folder / file_name, "show")
+    folder = season_folder(library_folder(SERIES, "tv", show), guess["season"])
+    file_name = f"{show.name} - {episode_code(guess['season'], guess['episode'])}{video.suffix.lower()}"
+    return Placement(video, folder / file_name, "show")
 
 
 def is_identical_copy(source: Path, destination: Path) -> bool:
