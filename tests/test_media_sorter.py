@@ -14,18 +14,21 @@ REAL_TMDB_SEARCH = sorter.tmdb_search
 # As strict as TMDb's search API: every query word must be in the title, and the year must match.
 CATALOGUE = {
     "movie": [
-        {"title": "Tornado", "release_date": "2025-06-06"},
-        {"title": "Zum Glück gibt's Schreiner", "release_date": "2020-02-01"},
-        {"title": "Dune: Part Two", "release_date": "2024-02-27"},
-        {"title": "Dune", "release_date": "2021-09-15"},
-        {"title": "Schreiner", "release_date": "2011-01-01"},
-        {"title": "2001: A Space Odyssey", "release_date": "1968-04-02"},
-        {"title": "13 Hours: The Secret Soldiers of Benghazi", "release_date": "2016-01-13"},
-        {"title": "28 Years Later: The Bone Temple", "release_date": "2026-01-14"},
+        {"title": "Tornado", "release_date": "2025-06-06", "id": 100},
+        {"title": "Zum Glück gibt's Schreiner", "release_date": "2020-02-01", "id": 101},
+        {"title": "Dune: Part Two", "release_date": "2024-02-27", "id": 102},
+        {"title": "Dune", "release_date": "2021-09-15", "id": 103},
+        {"title": "Schreiner", "release_date": "2011-01-01", "id": 104},
+        {"title": "2001: A Space Odyssey", "release_date": "1968-04-02", "id": 105},
+        {"title": "13 Hours: The Secret Soldiers of Benghazi", "release_date": "2016-01-13", "id": 106},
+        {"title": "28 Years Later: The Bone Temple", "release_date": "2026-01-14", "id": 107},
     ],
     "tv": [
-        {"name": "Elsbeth", "first_air_date": "2024-02-29"},
-        {"name": "The Bear", "first_air_date": "2022-06-23"},
+        {"name": "Elsbeth", "first_air_date": "2024-02-29", "id": 108},
+        {"name": "The Bear", "first_air_date": "2022-06-23", "id": 109},
+        {"name": "Lupin", "first_air_date": "2021-01-08", "id": 110},
+        {"name": "Scrubs", "first_air_date": "2001-10-02", "id": 4556},
+        {"name": "Scrubs", "first_air_date": "2026-02-25", "id": 295778},
     ],
 }
 
@@ -170,7 +173,7 @@ def test_search_attempts_without_a_year_never_leave_words_out():
 
 
 def test_tmdb_lookup_finds_a_german_title_written_without_umlauts_and_apostrophe():
-    assert sorter.tmdb_lookup("movie", "Zum Glueck gibts Schreiner", 2020) == "Zum Glück gibt's Schreiner (2020)"
+    assert sorter.tmdb_lookup("movie", "Zum Glueck gibts Schreiner", 2020).name == "Zum Glück gibt's Schreiner (2020)"
 
 
 def test_tmdb_lookup_does_not_guess_a_different_movie_by_leaving_words_out():
@@ -178,15 +181,15 @@ def test_tmdb_lookup_does_not_guess_a_different_movie_by_leaving_words_out():
 
 
 def test_tmdb_lookup_falls_back_to_no_year_when_the_year_is_off():
-    assert sorter.tmdb_lookup("movie", "Tornado", 2024) == "Tornado (2025)"
+    assert sorter.tmdb_lookup("movie", "Tornado", 2024).name == "Tornado (2025)"
 
 
 def test_tmdb_lookup_makes_the_name_safe_for_a_folder():
-    assert sorter.tmdb_lookup("movie", "Dune Part Two", 2024) == "Dune Part Two (2024)"
+    assert sorter.tmdb_lookup("movie", "Dune Part Two", 2024).name == "Dune Part Two (2024)"
 
 
 def test_tmdb_lookup_for_series():
-    assert sorter.tmdb_lookup("tv", "Elsbeth", None) == "Elsbeth (2024)"
+    assert sorter.tmdb_lookup("tv", "Elsbeth", None).name == "Elsbeth (2024)"
 
 
 class FakeResponse(io.BytesIO):
@@ -263,7 +266,7 @@ def test_plan_season_pack_puts_every_episode_into_its_season_folder(library):
         download(f"{item.name}/4sf-elsbeth-sd-s03e{episode}.mkv")
 
     destinations = sorted(placement.destination for placement in sorter.plan(item))
-    season = sorter.SERIES / "Elsbeth (2024)" / "Season 03"
+    season = sorter.SERIES / "Elsbeth (2024)" / "season_03"
     assert destinations == [season / "Elsbeth (2024) - S03E02.mkv", season / "Elsbeth (2024) - S03E20.mkv"]
 
 
@@ -271,7 +274,7 @@ def test_plan_episode_takes_the_season_from_the_folder_when_the_file_lacks_it(li
     item = sorter.DOWNLOADS / "The.Bear.S02E05.1080p.WEB.h264-GRP"
     download(f"{item.name}/abc123.mkv")
 
-    assert sorter.plan(item)[0].destination == sorter.SERIES / "The Bear (2022)" / "Season 02" / "The Bear (2022) - S02E05.mkv"
+    assert sorter.plan(item)[0].destination == sorter.SERIES / "The Bear (2022)" / "season_02" / "The Bear (2022) - S02E05.mkv"
 
 
 def test_plan_leaves_a_folder_without_video(library):
@@ -313,13 +316,60 @@ def test_plan_movie_does_not_reuse_a_folder_of_another_year(library):
 
 
 def test_plan_episode_puts_a_new_season_into_the_existing_show_folder(library):
-    (sorter.SERIES / "the bear (2022)" / "Season 01").mkdir(parents=True)
+    (sorter.SERIES / "the bear (2022)" / "season_01").mkdir(parents=True)
     item = sorter.DOWNLOADS / "The.Bear.S02E01.1080p.WEB"
     download(f"{item.name}/the.bear.s02e01.mkv")
 
     assert sorter.plan(item)[0].destination == (
-        sorter.SERIES / "the bear (2022)" / "Season 02" / "The Bear (2022) - S02E01.mkv"
+        sorter.SERIES / "the bear (2022)" / "season_02" / "The Bear (2022) - S02E01.mkv"
     )
+
+
+@pytest.mark.parametrize("existing", ["season_04", "Season 04", "Season 4"])
+def test_plan_episode_reuses_the_season_folder_however_it_is_spelled(library, existing):
+    (sorter.SERIES / "Lupin" / existing).mkdir(parents=True)
+    item = sorter.DOWNLOADS / "Lupin.S04E03.GERMAN.DL.1080P.WEB.X264-WAYNE"
+    download(f"{item.name}/lupin.s04e03.german.dl.1080p.web.x264-wayne.mkv")
+
+    assert sorter.plan(item)[0].destination.parent == sorter.SERIES / "Lupin" / existing
+
+
+def test_plan_episode_reuses_a_show_folder_without_the_year(library):
+    (sorter.SERIES / "Lupin" / "season_03").mkdir(parents=True)
+    item = sorter.DOWNLOADS / "Lupin.S04E03.GERMAN.DL.1080P.WEB.X264-WAYNE"
+    download(f"{item.name}/lupin.s04e03.german.dl.1080p.web.x264-wayne.mkv")
+
+    assert sorter.plan(item)[0].destination == sorter.SERIES / "Lupin" / "season_04" / "Lupin (2021) - S04E03.mkv"
+
+
+def test_plan_episode_does_not_reuse_a_folder_without_the_year_that_tmdb_takes_for_another_show(library):
+    (sorter.SERIES / "Scrubs" / "season_01").mkdir(parents=True)
+    item = sorter.DOWNLOADS / "Scrubs.2026.S01E01.GERMAN.DL.1080p.WEB.x264"
+    download(f"{item.name}/scrubs.2026.s01e01.mkv")
+
+    assert sorter.plan(item)[0].destination.parent.parent == sorter.SERIES / "Scrubs (2026)"
+
+
+@pytest.mark.parametrize("release, folder", [
+    ("Scrubs.2001.S09E01.1080p.WEB", "Scrubs (2001) {tmdb-4556}"),
+    ("Scrubs.2026.S01E02.1080p.WEB", "Scrubs (2026) {tmdb-295778}"),
+])
+def test_plan_episode_puts_a_show_into_the_folder_tagged_with_its_tmdb_id(library, release, folder):
+    (sorter.SERIES / "Scrubs (2001) {tmdb-4556}").mkdir()
+    (sorter.SERIES / "Scrubs (2026) {tmdb-295778}").mkdir()
+    item = sorter.DOWNLOADS / release
+    download(f"{release}/episode.mkv")
+
+    assert sorter.plan(item)[0].destination.parent.parent == sorter.SERIES / folder
+
+
+def test_plan_episode_prefers_the_show_folder_with_the_year(library):
+    (sorter.SERIES / "Lupin").mkdir()
+    (sorter.SERIES / "Lupin (2021)").mkdir()
+    item = sorter.DOWNLOADS / "Lupin.S04E03.GERMAN.DL.1080P.WEB.X264-WAYNE"
+    download(f"{item.name}/lupin.s04e03.german.dl.1080p.web.x264-wayne.mkv")
+
+    assert sorter.plan(item)[0].destination.parent.parent == sorter.SERIES / "Lupin (2021)"
 
 
 # Moving
@@ -392,7 +442,7 @@ def test_a_first_version_logs_no_duplicate(library, caplog):
 
 def test_a_new_episode_next_to_other_episodes_is_no_duplicate(library, caplog):
     caplog.set_level("INFO")
-    season = sorter.SERIES / "The Bear (2022)" / "Season 02"
+    season = sorter.SERIES / "The Bear (2022)" / "season_02"
     season.mkdir(parents=True)
     (season / "The Bear (2022) - S02E01.mkv").write_bytes(b"episode 1")
     item = sorter.DOWNLOADS / "The.Bear.S02E02.1080p.WEB"
@@ -517,7 +567,7 @@ def test_watch_files_a_settled_download_and_rescans_plex(library, monkeypatch):
 
     assert library_files(library) == [
         "movies/Tornado (2025)/tornado.mkv",
-        "series/The Bear (2022)/Season 02/The Bear (2022) - S02E05.mkv",
+        "series/The Bear (2022)/season_02/The Bear (2022) - S02E05.mkv",
     ]
     assert rescans == [{"movie", "show"}]
 
