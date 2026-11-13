@@ -211,7 +211,13 @@ def search_attempts(title: str, year: int | None) -> list[tuple[str, int | None]
         return [(spelling, None) for spelling in spellings]
     words = spellings[-1].split()
     # one word TMDb doesn't know, like "gibts" for "gibt's", fails the whole search
-    one_word_left_out = [" ".join(words[:i] + words[i + 1:]) for i in range(len(words))] if len(words) >= 3 else []
+    if len(words) >= 3:
+        one_word_left_out = [" ".join(words[:i] + words[i + 1:]) for i in range(len(words))]
+    elif len(words) == 2 and words[-1].isdigit():
+        # releases call the first film of a series "Pusher 1", TMDb just "Pusher"
+        one_word_left_out = [words[0]]
+    else:
+        one_word_left_out = []
     return [(query, year) for query in spellings + one_word_left_out] + [(spelling, None) for spelling in spellings]
 
 
