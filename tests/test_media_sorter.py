@@ -168,6 +168,11 @@ def test_search_attempts_go_from_exact_to_loose_and_loose_ones_need_the_year():
     ]
 
 
+def test_search_attempts_drop_a_series_number_from_a_two_word_title():
+    assert sorter.search_attempts("Pusher 1", 1996) == [("Pusher 1", 1996), ("Pusher", 1996), ("Pusher 1", None)]
+    assert sorter.search_attempts("The Bear", 2022) == [("The Bear", 2022), ("The Bear", None)]
+
+
 def test_search_attempts_without_a_year_never_leave_words_out():
     assert sorter.search_attempts("The Bear", None) == [("The Bear", None)]
 
