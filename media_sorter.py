@@ -2,7 +2,7 @@
 """Watches the download folder and files finished movies and series into the Plex libraries.
 
 Movies:  MOVIES/Title (Year)/<original file name>
-Series:  SERIES/Show (Year)/season_01/Show (Year) - S01E02.mkv
+Series:  SERIES/Show (Year)/season_01/Show.s01.e02.Episode.Title.1080p.HEVC.mkv
 
 Anything that isn't a recognisable movie or episode is left where it is.
 """
@@ -176,26 +176,52 @@ def season_folder(show_folder: Path, season: int) -> Path:
     return show_folder / f"season_{season:02}"
 
 
-def episode_code(season: int, episode: int | list[int]) -> str:
-    episodes = episode if isinstance(episode, list) else [episode]
-    return f"S{season:02}" + "-".join(f"E{number:02}" for number in episodes)
+def episode_code(season: int, episodes: list[int]) -> str:
+    return f"s{season:02}." + "-".join(f"e{number:02}" for number in episodes)
 
 
-def tmdb_search(kind: str, params: dict) -> list[dict]:
+def dotted(text: str) -> str:
+    return ".".join(safe_filename(text).split())
+
+
+def codec_label(video_codec: str | None) -> str | None:
+    if not isinstance(video_codec, str):
+        return None
+    return {"H.265": "HEVC", "H.264": "H264"}.get(video_codec, video_codec.replace(".", ""))
+
+
+def tmdb_get(path: str, params: dict) -> dict | None:
+    """The TMDb API's answer for path, or None if TMDb has nothing there."""
     key = TMDB_KEY.strip().strip("\"'")
     # TMDb hands out two credentials: the short v3 API key and the long "Read Access Token" (a JWT)
     if key.startswith("eyJ"):
         headers = {"Authorization": f"Bearer {key}"}
     else:
         headers, params = {}, {**params, "api_key": key}
-    url = f"https://api.themoviedb.org/3/search/{kind}?{urllib.parse.urlencode(params)}"
+    url = f"https://api.themoviedb.org/3/{path}?{urllib.parse.urlencode(params)}"
     try:
         with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=15) as response:
-            return json.load(response)["results"]
+            return json.load(response)
     except urllib.error.HTTPError as error:
         if error.code == 401:
             raise SystemExit("TMDb rejected TMDB_KEY (401): check it at https://www.themoviedb.org/settings/api")
+        if error.code == 404:
+            return None
         raise
+
+
+def tmdb_search(kind: str, params: dict) -> list[dict]:
+    return tmdb_get(f"search/{kind}", params)["results"]
+
+
+def tmdb_season_episodes(show_id: int, season: int) -> list[dict]:
+    season_details = tmdb_get(f"tv/{show_id}/season/{season}", {})
+    return season_details["episodes"] if season_details else []
+
+
+@functools.cache
+def episode_titles(show_id: int, season: int) -> dict[int, str]:
+    return {episode["episode_number"]: episode["name"] for episode in tmdb_season_episodes(show_id, season) if episode.get("name")}
 
 
 def with_umlauts(title: str) -> str:
@@ -282,8 +308,18 @@ def plan_episode(video: Path, guess: dict) -> Placement:
     if not show:
         raise NotRecognised(f"TMDb has no series '{guess['title']}'")
     folder = season_folder(library_folder(SERIES, "tv", show), guess["season"])
-    file_name = f"{show.name} - {episode_code(guess['season'], guess['episode'])}{video.suffix.lower()}"
+    file_name = episode_file_name(show, guess) + video.suffix.lower()
     return Placement(video, folder / file_name, "show")
+
+
+def episode_file_name(show: TmdbMatch, guess: dict) -> str:
+    """Like "Modern.Family.s04.e02.Schooled.1080p.HEVC", leaving out what TMDb or the release doesn't say."""
+    season = guess["season"]
+    episodes = guess["episode"] if isinstance(guess["episode"], list) else [guess["episode"]]
+    titles = episode_titles(show.id, season)
+    title = "+".join(dict.fromkeys(filter(None, (dotted(titles[number]) for number in episodes if number in titles))))
+    parts = [dotted(without_year(show.name)), episode_code(season, episodes), title, guess.get("screen_size"), codec_label(guess.get("video_codec"))]
+    return ".".join(filter(None, parts))
 
 
 def is_identical_copy(source: Path, destination: Path) -> bool:

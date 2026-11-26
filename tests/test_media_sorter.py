@@ -10,6 +10,7 @@ import media_sorter as sorter
 
 # taken before the autouse fixture swaps it for the fake catalogue
 REAL_TMDB_SEARCH = sorter.tmdb_search
+REAL_TMDB_SEASON_EPISODES = sorter.tmdb_season_episodes
 
 # As strict as TMDb's search API: every query word must be in the title, and the year must match
 # the first release or, for movies, any later one.
@@ -32,6 +33,17 @@ CATALOGUE = {
         {"name": "Lupin", "first_air_date": "2021-01-08", "id": 110},
         {"name": "Scrubs", "first_air_date": "2001-10-02", "id": 4556},
         {"name": "Scrubs", "first_air_date": "2026-02-25", "id": 295778},
+        {"name": "Modern Family", "first_air_date": "2009-09-23", "id": 1421},
+    ],
+}
+
+EPISODES = {
+    (1421, 1): [
+        {"episode_number": 1, "name": "Pilot"},
+        {"episode_number": 2, "name": "The Bicycle Thief"},
+        {"episode_number": 3, "name": "Come Fly with Me"},
+        {"episode_number": 4, "name": "The Incident: Part 1?"},
+        {"episode_number": 5, "name": ""},
     ],
 }
 
@@ -68,7 +80,9 @@ def library(tmp_path, monkeypatch):
         monkeypatch.setattr(sorter, host_path, "")
     monkeypatch.setattr(sorter, "run_now", False)
     monkeypatch.setattr(sorter, "tmdb_search", fake_tmdb_search)
+    monkeypatch.setattr(sorter, "tmdb_season_episodes", lambda show_id, season: EPISODES.get((show_id, season), []))
     sorter.tmdb_lookup.cache_clear()
+    sorter.episode_titles.cache_clear()
     return tmp_path
 
 
@@ -122,8 +136,37 @@ def test_safe_filename_follows_the_library_and_drops_characters_windows_trips_ov
 
 
 def test_episode_code():
-    assert sorter.episode_code(3, 2) == "S03E02"
-    assert sorter.episode_code(1, [1, 2]) == "S01E01-E02"
+    assert sorter.episode_code(3, [2]) == "s03.e02"
+    assert sorter.episode_code(1, [1, 2]) == "s01.e01-e02"
+
+
+MODERN_FAMILY = sorter.TmdbMatch("Modern Family (2009)", 1421)
+
+
+@pytest.mark.parametrize("episode, expected", [
+    (1, "Modern.Family.s01.e01.Pilot.1080p.HEVC"),
+    ([2, 3], "Modern.Family.s01.e02-e03.The.Bicycle.Thief+Come.Fly.with.Me.1080p.HEVC"),
+    (4, "Modern.Family.s01.e04.The.Incident.Part.1.1080p.HEVC"),
+    (5, "Modern.Family.s01.e05.1080p.HEVC"),
+    (99, "Modern.Family.s01.e99.1080p.HEVC"),
+])
+def test_episode_file_name_carries_the_tmdb_title_and_quality(episode, expected):
+    guess = {"season": 1, "episode": episode, "screen_size": "1080p", "video_codec": "H.265"}
+    assert sorter.episode_file_name(MODERN_FAMILY, guess) == expected
+
+
+def test_episode_file_name_without_tmdb_season_or_quality_has_just_show_and_code():
+    assert sorter.episode_file_name(MODERN_FAMILY, {"season": 7, "episode": 1}) == "Modern.Family.s07.e01"
+
+
+def test_episode_file_name_from_a_real_release():
+    guess = sorter.guessit("Modern.Family.S01.German.DL.1080p.WEB.x265-OHD/modern.family.s01e02.mkv")
+    assert sorter.episode_file_name(MODERN_FAMILY, guess) == "Modern.Family.s01.e02.The.Bicycle.Thief.1080p.HEVC"
+
+
+@pytest.mark.parametrize("video_codec, label", [("H.265", "HEVC"), ("H.264", "H264"), ("AV1", "AV1"), (None, None)])
+def test_codec_label(video_codec, label):
+    assert sorter.codec_label(video_codec) == label
 
 
 def test_with_umlauts():
@@ -215,16 +258,31 @@ class FakeResponse(io.BytesIO):
 
 @pytest.fixture
 def sent_requests(monkeypatch):
-    """Lets the real tmdb_search run against a fake TMDb and collects what it sends."""
+    """Lets the real TMDb calls run against a fake TMDb and collects what it sends."""
     monkeypatch.setattr(sorter, "tmdb_search", REAL_TMDB_SEARCH)
+    monkeypatch.setattr(sorter, "tmdb_season_episodes", REAL_TMDB_SEASON_EPISODES)
     requests = []
 
     def fake_urlopen(request, timeout):
         requests.append(request)
-        return FakeResponse(json.dumps({"results": []}).encode())
+        return FakeResponse(json.dumps({"results": [], "episodes": []}).encode())
 
     monkeypatch.setattr(sorter.urllib.request, "urlopen", fake_urlopen)
     return requests
+
+
+def test_tmdb_season_episodes_asks_for_the_season(monkeypatch, sent_requests):
+    sorter.tmdb_season_episodes(1421, 1)
+
+    assert "/3/tv/1421/season/1?" in sent_requests[0].full_url
+
+
+def test_tmdb_season_episodes_of_a_season_tmdb_does_not_know_is_empty(monkeypatch):
+    def not_found(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(sorter.urllib.request, "urlopen", not_found)
+    assert REAL_TMDB_SEASON_EPISODES(1421, 42) == []
 
 
 def test_tmdb_search_sends_a_read_access_token_as_bearer(monkeypatch, sent_requests):
@@ -273,6 +331,14 @@ def test_plan_movie_with_a_part_in_its_title(library):
     assert sorter.plan(item)[0].destination == sorter.MOVIES / "Dune Part Two (2024)" / "movie.mkv"
 
 
+def test_plan_episode_named_like_the_library_gets_its_title(library):
+    video = download("Modern Family (2009) - S01E01.mkv")
+
+    assert sorter.plan(video)[0].destination == (
+        sorter.SERIES / "Modern Family (2009)" / "season_01" / "Modern.Family.s01.e01.Pilot.mkv"
+    )
+
+
 def test_plan_season_pack_puts_every_episode_into_its_season_folder(library):
     item = sorter.DOWNLOADS / "Elsbeth S03 German DL WEB x264-4SF - serienfans org"
     for episode in ("02", "20"):
@@ -280,14 +346,14 @@ def test_plan_season_pack_puts_every_episode_into_its_season_folder(library):
 
     destinations = sorted(placement.destination for placement in sorter.plan(item))
     season = sorter.SERIES / "Elsbeth (2024)" / "season_03"
-    assert destinations == [season / "Elsbeth (2024) - S03E02.mkv", season / "Elsbeth (2024) - S03E20.mkv"]
+    assert destinations == [season / "Elsbeth.s03.e02.H264.mkv", season / "Elsbeth.s03.e20.H264.mkv"]
 
 
 def test_plan_episode_takes_the_season_from_the_folder_when_the_file_lacks_it(library):
     item = sorter.DOWNLOADS / "The.Bear.S02E05.1080p.WEB.h264-GRP"
     download(f"{item.name}/abc123.mkv")
 
-    assert sorter.plan(item)[0].destination == sorter.SERIES / "The Bear (2022)" / "season_02" / "The Bear (2022) - S02E05.mkv"
+    assert sorter.plan(item)[0].destination == sorter.SERIES / "The Bear (2022)" / "season_02" / "The.Bear.s02.e05.1080p.H264.mkv"
 
 
 def test_plan_leaves_a_folder_without_video(library):
@@ -334,7 +400,7 @@ def test_plan_episode_puts_a_new_season_into_the_existing_show_folder(library):
     download(f"{item.name}/the.bear.s02e01.mkv")
 
     assert sorter.plan(item)[0].destination == (
-        sorter.SERIES / "the bear (2022)" / "season_02" / "The Bear (2022) - S02E01.mkv"
+        sorter.SERIES / "the bear (2022)" / "season_02" / "The.Bear.s02.e01.1080p.mkv"
     )
 
 
@@ -352,7 +418,7 @@ def test_plan_episode_reuses_a_show_folder_without_the_year(library):
     item = sorter.DOWNLOADS / "Lupin.S04E03.GERMAN.DL.1080P.WEB.X264-WAYNE"
     download(f"{item.name}/lupin.s04e03.german.dl.1080p.web.x264-wayne.mkv")
 
-    assert sorter.plan(item)[0].destination == sorter.SERIES / "Lupin" / "season_04" / "Lupin (2021) - S04E03.mkv"
+    assert sorter.plan(item)[0].destination == sorter.SERIES / "Lupin" / "season_04" / "Lupin.s04.e03.1080p.H264.mkv"
 
 
 def test_plan_episode_does_not_reuse_a_folder_without_the_year_that_tmdb_takes_for_another_show(library):
@@ -580,7 +646,7 @@ def test_watch_files_a_settled_download_and_rescans_plex(library, monkeypatch):
 
     assert library_files(library) == [
         "movies/Tornado (2025)/tornado.mkv",
-        "series/The Bear (2022)/season_02/The Bear (2022) - S02E05.mkv",
+        "series/The Bear (2022)/season_02/The.Bear.s02.e05.1080p.mkv",
     ]
     assert rescans == [{"movie", "show"}]
 
