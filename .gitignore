@@ -1,5 +1,6 @@
 # hold the TMDb key and the Plex token
 .env
 media-sorter.env
+dev.env
 __pycache__/
 .pytest_cache/
