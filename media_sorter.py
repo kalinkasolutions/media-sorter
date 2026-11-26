@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Watches the download folder and files finished movies and series into the Plex libraries.
+"""Watches the download folder and files finished movies, series and games into their libraries.
 
 Movies:  MOVIES/Title (Year)/<original file name>
 Series:  SERIES/Show (Year)/season_01/Show.s01.e02.Episode.Title.1080p.HEVC.mkv
+Games:   GAMES/Game (Year)/Game-Group.iso, other files keep their names and subfolders
+Updates: GAMES/Game (Year)/update-301524-302256/<original file names>
 
 Anything that isn't a recognisable movie or episode is left where it is.
 """
@@ -29,11 +31,15 @@ VERSION = os.environ.get("VERSION", "dev")
 DOWNLOADS = Path(os.environ.get("DOWNLOADS", "/mnt/shared"))
 MOVIES = Path(os.environ.get("MOVIES", "/storage/movies"))
 SERIES = Path(os.environ.get("SERIES", "/storage/series"))
+GAMES = Path(os.environ.get("GAMES", "/storage/games"))
 # the same folders as the host sees them, only for the log; compose passes them in
 HOST_DOWNLOADS = os.environ.get("HOST_DOWNLOADS", "")
 HOST_MOVIES = os.environ.get("HOST_MOVIES", "")
 HOST_SERIES = os.environ.get("HOST_SERIES", "")
+HOST_GAMES = os.environ.get("HOST_GAMES", "")
 TMDB_KEY = os.environ.get("TMDB_KEY", "")
+IGDB_CLIENT_ID = os.environ.get("IGDB_CLIENT_ID", "")
+IGDB_CLIENT_SECRET = os.environ.get("IGDB_CLIENT_SECRET", "")
 PLEX_URL = os.environ.get("PLEX_URL", "").rstrip("/")
 PLEX_TOKEN = os.environ.get("PLEX_TOKEN", "")
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
@@ -42,6 +48,17 @@ POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "5" if DRY_RUN else "30"))
 SETTLE_SECONDS = int(os.environ.get("SETTLE_SECONDS", "0" if DRY_RUN else "300"))
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".wmv"}
+# disc images and installers; the folder holding one is a game
+GAME_EXTENSIONS = {".iso", ".exe", ".msi", ".bin", ".cue", ".nsp", ".xci", ".nsz", ".pkg", ".chd", ".rvz", ".wbfs"}
+# the download site's links, not part of the game
+LINK_EXTENSIONS = {".url", ".htm", ".html"}
+# where a release name stops being the game's name: "Phantom.Blade.Zero.Deluxe.Edition.Hypervisor"
+RELEASE_NOISE = re.compile(
+    r"\b(?:\w+ edition|goty|hypervisor|crack|update|repack|multi\d*|incl|build \d+|v\d[\d.]*)\b.*",
+    re.IGNORECASE,
+)
+# IGDB's game_type for a main game, remake, remaster, expanded game and port; not DLCs, mods or bundles
+MAIN_GAME_TYPES = {0, 8, 9, 10, 11}
 # JDownloader's in-progress downloads
 UNFINISHED_SUFFIXES = {".part"}
 # a download folder containing this file is left alone; JDownloader needs the folder's name kept
@@ -71,7 +88,7 @@ def stop(signum, frame) -> None:
 class Placement:
     source: Path
     destination: Path
-    plex_type: str  # Plex's section type: "movie" or "show"
+    plex_type: str | None  # Plex's section type: "movie" or "show"; None for a game, Plex has no games
 
 
 @dataclass(frozen=True)
@@ -113,7 +130,7 @@ def videos_in(item: Path) -> list[Path]:
 
 
 def shown(path: Path) -> str:
-    for root, host_root in ((DOWNLOADS, HOST_DOWNLOADS), (MOVIES, HOST_MOVIES), (SERIES, HOST_SERIES)):
+    for root, host_root in ((DOWNLOADS, HOST_DOWNLOADS), (MOVIES, HOST_MOVIES), (SERIES, HOST_SERIES), (GAMES, HOST_GAMES)):
         if host_root and path.is_relative_to(root):
             return str(Path(host_root) / path.relative_to(root))
     return str(path)
@@ -274,9 +291,14 @@ def released_near(date: str | None, year: int) -> bool:
 
 
 def plan(item: Path) -> list[Placement]:
+    game_roots = game_roots_in(item)
+    # games carry cutscene videos, and a movie can come with a stray setup.exe
+    if game_roots and not is_mostly_video(item):
+        return [placement for root in game_roots for placement in plan_game(root)]
+
     videos = videos_in(item)
     if not videos:
-        raise NotRecognised("no video file")
+        raise NotRecognised("no video or game file")
 
     # guessit reads the folder names too, which often carry the info the file name lacks
     guesses = {video: guessit(str(video.relative_to(DOWNLOADS))) for video in videos}
@@ -322,6 +344,143 @@ def episode_file_name(show: TmdbMatch, guess: dict) -> str:
     return ".".join(filter(None, parts))
 
 
+def is_mostly_video(item: Path) -> bool:
+    total = sum(path.stat().st_size for path in files_in(item))
+    return sum(path.stat().st_size for path in videos_in(item)) * 2 > total
+
+
+def game_roots_in(item: Path) -> list[Path]:
+    """The outermost folders holding a game file, one per game; a folder like "Games" can hold several."""
+    holders = {path.parent for path in files_in(item) if path.suffix.lower() in GAME_EXTENSIONS}
+    if item.is_file():
+        return [item] if holders else []
+    return sorted(holder for holder in holders if not any(holder != other and holder.is_relative_to(other) for other in holders))
+
+
+def release_title_and_group(release: str) -> tuple[str, str | None]:
+    """"Baba.Is.You-ElAmigos - more games on GLOAD.cc" -> ("Baba Is You", "ElAmigos")."""
+    name = re.split(r"\s+-\s+", release)[0]
+    group = None
+    # two capitals tell a group like "ElAmigos" or "TENOKE" from the end of "Half-Life"
+    found = re.search(r"-([A-Za-z0-9]+)$", name)
+    if found and sum(letter.isupper() for letter in found[1]) >= 2:
+        group, name = found[1], name[:found.start()]
+    name = re.sub(r"\[.*?\]|\(.*?\)|\{.*?\}", " ", name)
+    # dots and underscores separate words, but not the digits of a version like 1.5
+    name = re.sub(r"(?<!\d)[._]|[._](?!\d)", " ", name)
+    name = RELEASE_NOISE.sub("", name)
+    return " ".join(name.split()), group
+
+
+def release_name(root: Path) -> str:
+    """The name of the innermost folder with a release group, as the game may sit in one called "game" or "bin"."""
+    names = [root.stem if root.is_file() else root.name] + [folder.name for folder in root.parents if folder.is_relative_to(DOWNLOADS) and folder != DOWNLOADS]
+    return next((name for name in names if release_title_and_group(name)[1]), names[0])
+
+
+def update_folder_name(release: str) -> str | None:
+    """"Phantom Blade Zero update 301524 - 302256 - more games on GLOAD.cc" -> "update-301524-302256"."""
+    name = re.sub(r"\s+-\s+more games on .*$", "", release, flags=re.IGNORECASE)
+    found = re.search(r"\bupdate\b(.*)", name, re.IGNORECASE)
+    if not found:
+        return None
+    versions = re.findall(r"v?\d[\d.]*\d|v?\d", found[1]) or re.findall(r"\bv\d[\d.]*\d", name)
+    return "-".join(["update", *versions])
+
+
+def plan_game(root: Path) -> list[Placement]:
+    release = release_name(root)
+    title, group = release_title_and_group(release)
+    if not title:
+        raise NotRecognised(f"no game name in {root.name}")
+    match = igdb_lookup(title)
+    if not match:
+        raise NotRecognised(f"IGDB has no game '{title}'")
+    folder = game_folder(match)
+    update = update_folder_name(release)
+    if update:
+        folder /= update
+    files = [path for path in files_in(root) if path.suffix.lower() not in LINK_EXTENSIONS]
+    # an update keeps its file names; several discs too, so they don't all become the same file
+    images = [] if update else [path for path in files if path.suffix.lower() == ".iso"]
+    image_name = f"{without_year(match)}-{group}.iso" if group else f"{without_year(match)}.iso"
+
+    def destination(path: Path) -> Path:
+        if images == [path]:
+            return folder / image_name
+        return folder / (path.name if root.is_file() else path.relative_to(root))
+
+    return [Placement(path, destination(path), None) for path in files]
+
+
+def game_folder(match: str) -> Path:
+    """The folder for match, reusing one spelled differently or without the year."""
+    if GAMES.is_dir():
+        for folder in sorted(GAMES.iterdir()):
+            if folder.is_dir() and folder_key(folder.name) in (folder_key(match), folder_key(without_year(match))):
+                return folder
+    return GAMES / match
+
+
+@functools.cache
+def igdb_token() -> str:
+    form = urllib.parse.urlencode({"client_id": IGDB_CLIENT_ID, "client_secret": IGDB_CLIENT_SECRET, "grant_type": "client_credentials"})
+    try:
+        with urllib.request.urlopen("https://id.twitch.tv/oauth2/token", data=form.encode(), timeout=15) as response:
+            return json.load(response)["access_token"]
+    except urllib.error.HTTPError as error:
+        if error.code in (400, 401, 403):
+            raise SystemExit(f"Twitch rejected IGDB_CLIENT_ID/IGDB_CLIENT_SECRET ({error.code}): check them at https://dev.twitch.tv/console/apps")
+        raise
+
+
+def igdb_post(body: str) -> list[dict]:
+    request = urllib.request.Request(
+        "https://api.igdb.com/v4/games",
+        data=body.encode(),
+        headers={"Client-ID": IGDB_CLIENT_ID, "Authorization": f"Bearer {igdb_token()}"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.load(response)
+
+
+def igdb_search(query: str) -> list[dict]:
+    if not IGDB_CLIENT_ID:
+        raise NotRecognised("IGDB_CLIENT_ID is not set")
+    query = query.replace('"', "")
+    body = f'search "{query}"; fields name,first_release_date,game_type; where version_parent = null; limit 10;'
+    try:
+        return igdb_post(body)
+    except urllib.error.HTTPError as error:
+        if error.code != 401:
+            raise
+        # the token runs out after about two months
+        igdb_token.cache_clear()
+        return igdb_post(body)
+
+
+@functools.cache
+def igdb_lookup(title: str) -> str | None:
+    """The game's "Name (Year)" from IGDB, or None if IGDB doesn't know it."""
+    words = title.split()
+    for word_count in range(len(words), 0, -1):
+        query = " ".join(words[:word_count])
+        results = igdb_search(query)
+        exact = [result for result in results if folder_key(result["name"]) == folder_key(query)]
+        # with words left out, only the exact name is safe: "Graveyard" is not "Graveyard Keeper"
+        candidates = results if word_count == len(words) else exact
+        candidates = sorted(candidates, key=lambda result: (result not in exact, result.get("game_type") not in MAIN_GAME_TYPES))
+        if candidates:
+            return game_name(candidates[0])
+    return None
+
+
+def game_name(result: dict) -> str:
+    released = result.get("first_release_date")
+    year = f" ({time.gmtime(released).tm_year})" if released else ""
+    return safe_filename(result["name"] + year)
+
+
 def is_identical_copy(source: Path, destination: Path) -> bool:
     return destination.is_file() and source.is_file() and filecmp.cmp(source, destination, shallow=False)
 
@@ -345,8 +504,8 @@ def move_into_library(source: Path, destination: Path) -> None:
 
 def file_into_library(item: Path, placements: list[Placement]) -> None:
     if DRY_RUN:
-        for placement in placements:
-            log.info("Would move %s -> %s", placement.source.relative_to(DOWNLOADS), shown(placement.destination))
+        for line in move_lines(placements):
+            log.info("Would move %s", line)
         return
 
     # a stop between the copy and deleting the download leaves an identical copy behind: finish that move
@@ -358,14 +517,16 @@ def file_into_library(item: Path, placements: list[Placement]) -> None:
 
     clashes = [placement.destination for placement in placements if placement.destination.exists()]
     if clashes:
-        raise NotRecognised(f"already in the library: {', '.join(map(shown, clashes))}")
+        more = f" and {len(clashes) - 3} more" if len(clashes) > 3 else ""
+        raise NotRecognised(f"already in the library: {', '.join(map(shown, clashes[:3]))}{more}")
 
     for placement in placements:
         try:
             move_into_library(placement.source, placement.destination)
         except OSError as error:
             raise MoveFailed(f"{placement.source.name} -> {shown(placement.destination)}: {error.strerror or error}")
-        log.info("Moved %s -> %s", placement.source.relative_to(DOWNLOADS), shown(placement.destination))
+        if placement.plex_type:
+            log.info("Moved %s", move_line(placement))
         # only movies: a season folder holds other episodes, not other versions
         if placement.plex_type == "movie":
             versions = len(videos_in(placement.destination.parent))
@@ -373,12 +534,40 @@ def file_into_library(item: Path, placements: list[Placement]) -> None:
                 # the Grafana alert "media-sorter duplicate" matches this wording; change both together
                 log.info("Duplicate: copied %s, the folder now has %d versions", placement.destination.parent.name, versions)
 
+    for line in game_move_lines(placements):
+        log.info("Moved %s", line)
+
     # what's left is .url/.txt/.html/.nfo, samples and extracted archives
     if item.is_dir():
         try:
             shutil.rmtree(item)
         except OSError as error:
             log.error("Filed %s, but could not delete the download folder: %s", item.name, error.strerror or error)
+
+
+def move_line(placement: Placement) -> str:
+    return f"{placement.source.relative_to(DOWNLOADS)} -> {shown(placement.destination)}"
+
+
+def game_move_lines(placements: list[Placement]) -> list[str]:
+    """One line per game rather than per file, as a game can have thousands."""
+    placements_per_game: dict[Path, list[Placement]] = {}
+    for placement in placements:
+        if placement.plex_type is None:
+            game = GAMES / placement.destination.relative_to(GAMES).parts[0]
+            placements_per_game.setdefault(game, []).append(placement)
+    lines = []
+    for game, game_placements in placements_per_game.items():
+        if len(game_placements) == 1:
+            lines.append(move_line(game_placements[0]))
+        else:
+            source = Path(os.path.commonpath([placement.source for placement in game_placements]))
+            lines.append(f"{source.relative_to(DOWNLOADS)} -> {shown(game)} ({len(game_placements)} files)")
+    return lines
+
+
+def move_lines(placements: list[Placement]) -> list[str]:
+    return [move_line(placement) for placement in placements if placement.plex_type] + game_move_lines(placements)
 
 
 def plex_request(path: str) -> dict:
@@ -463,7 +652,7 @@ def watch() -> None:
             try:
                 placements = plan(item)
                 file_into_library(item, placements)
-                touched_libraries |= {placement.plex_type for placement in placements}
+                touched_libraries |= {placement.plex_type for placement in placements} - {None}
                 first_seen_unchanged.pop(item, None)
                 if DRY_RUN:
                     skipped[item] = current
@@ -475,7 +664,7 @@ def watch() -> None:
                 # retried once the download changes or on a trigger, not every poll
                 skipped[item] = current
                 # files moved before the failure should still show up in Plex
-                touched_libraries |= {placement.plex_type for placement in placements}
+                touched_libraries |= {placement.plex_type for placement in placements} - {None}
             except Exception:
                 # network trouble and the like: try again next round
                 log.exception("Failed on %s", item.name)

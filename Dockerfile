@@ -10,6 +10,7 @@ ENV VERSION=$VERSION \
     PYTHONUNBUFFERED=1 \
     DOWNLOADS=/downloads \
     MOVIES=/movies \
-    SERIES=/series
+    SERIES=/series \
+    GAMES=/games
 
 CMD ["python", "/app/media_sorter.py"]

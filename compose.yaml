@@ -11,8 +11,10 @@ services:
       HOST_DOWNLOADS: ${DOWNLOADS_PATH:-/mnt/shared/jdownloader}
       HOST_MOVIES: ${MOVIES_PATH:-/mnt/movies}
       HOST_SERIES: ${SERIES_PATH:-/mnt/series}
+      HOST_GAMES: ${GAMES_PATH:-/mnt/games}
     volumes:
       - ${DOWNLOADS_PATH:-/mnt/shared/jdownloader}:/downloads
       # autofs mounts, so the container needs to see them mounted after it started
       - ${MOVIES_PATH:-/mnt/movies}:/movies:rslave
       - ${SERIES_PATH:-/mnt/series}:/series:rslave
+      - ${GAMES_PATH:-/mnt/games}:/games:rslave

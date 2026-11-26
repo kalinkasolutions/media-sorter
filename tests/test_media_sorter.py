@@ -11,6 +11,7 @@ import media_sorter as sorter
 # taken before the autouse fixture swaps it for the fake catalogue
 REAL_TMDB_SEARCH = sorter.tmdb_search
 REAL_TMDB_SEASON_EPISODES = sorter.tmdb_season_episodes
+REAL_IGDB_SEARCH = sorter.igdb_search
 
 # As strict as TMDb's search API: every query word must be in the title, and the year must match
 # the first release or, for movies, any later one.
@@ -48,6 +49,28 @@ EPISODES = {
 }
 
 
+# IGDB's answers as seen for these names; its search puts other games first at times
+GAMES = {
+    "Baba Is You": [
+        {"name": "Baba Is You: Baba Make Level", "first_release_date": 1609459200, "game_type": 14},
+        {"name": "Baba is You Xtreme", "first_release_date": 1641024000, "game_type": 0},
+        {"name": "Baba Is You", "first_release_date": 1552521600, "game_type": 0},
+    ],
+    "Grand Theft Auto IV": [
+        {"name": "Grand Theft Auto IV", "first_release_date": 1209427200, "game_type": 0},
+        {"name": "Grand Theft Auto IV: The Lost and Damned", "first_release_date": 1234224000, "game_type": 2},
+    ],
+    "Graveyard Keeper 2": [{"name": "Graveyard Keeper II", "first_release_date": 1767225600, "game_type": 0}],
+    "Hollow Knight": [
+        {"name": "Hollow Knight", "first_release_date": 1699833600, "game_type": 5},
+        {"name": "Hollow Knight", "first_release_date": 1487894400, "game_type": 0},
+    ],
+    "Phantom Blade Zero": [{"name": "Phantom Blade Zero", "first_release_date": 1757116800, "game_type": 0}],
+    "Undertale": [{"name": "Undertale", "first_release_date": 1442534400, "game_type": 0}],
+    "Graveyard": [{"name": "Graveyard Shift", "first_release_date": 946684800, "game_type": 0}],
+}
+
+
 def words(text: str) -> set[str]:
     return set(re.findall(r"\w+", text.casefold()))
 
@@ -69,20 +92,24 @@ class StopWatching(Exception):
 
 @pytest.fixture(autouse=True)
 def library(tmp_path, monkeypatch):
-    for folder in ("downloads", "movies", "series"):
+    for folder in ("downloads", "movies", "series", "games"):
         (tmp_path / folder).mkdir()
     monkeypatch.setattr(sorter, "DOWNLOADS", tmp_path / "downloads")
     monkeypatch.setattr(sorter, "MOVIES", tmp_path / "movies")
     monkeypatch.setattr(sorter, "SERIES", tmp_path / "series")
+    monkeypatch.setattr(sorter, "GAMES", tmp_path / "games")
     monkeypatch.setattr(sorter, "DRY_RUN", False)
     monkeypatch.setattr(sorter, "PLEX_URL", "")
-    for host_path in ("HOST_DOWNLOADS", "HOST_MOVIES", "HOST_SERIES"):
+    for host_path in ("HOST_DOWNLOADS", "HOST_MOVIES", "HOST_SERIES", "HOST_GAMES"):
         monkeypatch.setattr(sorter, host_path, "")
     monkeypatch.setattr(sorter, "run_now", False)
     monkeypatch.setattr(sorter, "tmdb_search", fake_tmdb_search)
     monkeypatch.setattr(sorter, "tmdb_season_episodes", lambda show_id, season: EPISODES.get((show_id, season), []))
+    monkeypatch.setattr(sorter, "igdb_search", lambda query: GAMES.get(query, []))
     sorter.tmdb_lookup.cache_clear()
     sorter.episode_titles.cache_clear()
+    sorter.igdb_lookup.cache_clear()
+    sorter.igdb_token.cache_clear()
     return tmp_path
 
 
@@ -356,12 +383,12 @@ def test_plan_episode_takes_the_season_from_the_folder_when_the_file_lacks_it(li
     assert sorter.plan(item)[0].destination == sorter.SERIES / "The Bear (2022)" / "season_02" / "The.Bear.s02.e05.1080p.H264.mkv"
 
 
-def test_plan_leaves_a_folder_without_video(library):
+def test_plan_leaves_a_folder_without_video_or_game(library):
     item = sorter.DOWNLOADS / "Well Dweller-ElAmigos"
-    download(f"{item.name}/setup.exe")
     download(f"{item.name}/game.part01.rar")
+    download(f"{item.name}/info.txt")
 
-    with pytest.raises(sorter.NotRecognised, match="no video file"):
+    with pytest.raises(sorter.NotRecognised, match="no video or game file"):
         sorter.plan(item)
 
 
@@ -724,7 +751,7 @@ def test_skip_marker_keeps_a_settled_download_in_place(library, monkeypatch):
 
 def test_unrecognised_download_is_reported_once_and_retried_after_a_trigger(library, monkeypatch, caplog):
     monkeypatch.setattr(sorter, "SETTLE_SECONDS", 0)
-    download("Games/setup.exe")
+    download("Totally.Unknown.Game-ElAmigos/setup.exe")
 
     def trigger_in_round_four(round_number):
         if round_number == 4:
@@ -732,7 +759,7 @@ def test_unrecognised_download_is_reported_once_and_retried_after_a_trigger(libr
 
     run_rounds(monkeypatch, rounds=4, before_round=trigger_in_round_four)
 
-    assert caplog.text.count("Leaving Games: no video file") == 2
+    assert caplog.text.count("Leaving Totally.Unknown.Game-ElAmigos: IGDB has no game 'Totally Unknown Game'") == 2
 
 
 def test_failed_move_is_logged_once(library, monkeypatch, caplog):
@@ -757,6 +784,7 @@ def host_paths(monkeypatch):
     monkeypatch.setattr(sorter, "HOST_DOWNLOADS", "/mnt/shared/jdownloader")
     monkeypatch.setattr(sorter, "HOST_MOVIES", "/mnt/movies")
     monkeypatch.setattr(sorter, "HOST_SERIES", "/mnt/series")
+    monkeypatch.setattr(sorter, "HOST_GAMES", "/mnt/games")
 
 
 def test_shown_names_paths_as_the_host_sees_them(host_paths):
@@ -824,6 +852,201 @@ def test_unknown_movie_without_a_year_does_not_say_none(library):
         sorter.plan(item)
 
     assert str(error.value) == "TMDb has no movie 'Totally Unknown Film'"
+
+
+# Games
+
+
+@pytest.mark.parametrize("release, title, group", [
+    ("Baba.Is.You-ElAmigos", "Baba Is You", "ElAmigos"),
+    ("Grand.Theft.Auto.IV.Complete.Edition-ElAmigos - more games on GLOAD.cc", "Grand Theft Auto IV", "ElAmigos"),
+    ("Phantom.Blade.Zero.Deluxe.Edition.Hypervisor-ElAmigos - more games on GLOAD.cc", "Phantom Blade Zero", "ElAmigos"),
+    ("Phantom Blade Zero - crack by voices38 - more games on GLOAD.cc", "Phantom Blade Zero", None),
+    ("Phantom Blade Zero update 301524 - 302256 - more games on GLOAD.cc", "Phantom Blade Zero", None),
+    ("Trees.Hate.You-TENOKE - more games on GLOAD.cc", "Trees Hate You", "TENOKE"),
+    ("Well Dweller-ElAmigos - more games on GLOAD cc", "Well Dweller", "ElAmigos"),
+    ("Undertale-ALiAS", "Undertale", "ALiAS"),
+    ("Graveyard Keeper 2", "Graveyard Keeper 2", None),
+    ("Hollow.Knight.v1.5.78.11833-GOG", "Hollow Knight", "GOG"),
+    ("Elden Ring [FitGirl Repack]", "Elden Ring", None),
+    ("Half-Life", "Half-Life", None),
+    ("Marvels.Spider-Man", "Marvels Spider-Man", None),
+])
+def test_release_title_and_group(release, title, group):
+    assert sorter.release_title_and_group(release) == (title, group)
+
+
+def test_igdb_lookup_prefers_the_exact_name():
+    assert sorter.igdb_lookup("Baba Is You") == "Baba Is You (2019)"
+
+
+def test_igdb_lookup_prefers_the_main_game_over_a_mod_of_the_same_name():
+    assert sorter.igdb_lookup("Hollow Knight") == "Hollow Knight (2017)"
+
+
+def test_igdb_lookup_takes_the_best_answer_for_the_full_name():
+    assert sorter.igdb_lookup("Graveyard Keeper 2") == "Graveyard Keeper II (2026)"
+
+
+def test_igdb_lookup_with_words_left_out_needs_the_exact_name():
+    assert sorter.igdb_lookup("Graveyard Something") is None
+    assert sorter.igdb_lookup("Undertale Something") == "Undertale (2015)"
+
+
+def test_plan_game_cleans_the_folder_and_names_the_image_after_game_and_group(library):
+    item = sorter.DOWNLOADS / "Grand.Theft.Auto.IV.Complete.Edition-ElAmigos - more games on GLOAD.cc"
+    download(f"{item.name}/Grand.Theft.Auto.IV.Complete.Edition-ElAmigos/gta4.iso")
+    download(f"{item.name}/Grand.Theft.Auto.IV.Complete.Edition-ElAmigos/more games.url")
+
+    assert [placement.destination for placement in sorter.plan(item)] == [
+        sorter.GAMES / "Grand Theft Auto IV (2008)" / "Grand Theft Auto IV-ElAmigos.iso",
+    ]
+
+
+def test_plan_game_keeps_the_names_of_several_discs_and_other_files(library):
+    item = sorter.DOWNLOADS / "Undertale-ALiAS"
+    download(f"{item.name}/disc1.iso")
+    download(f"{item.name}/disc2.iso")
+    download(f"{item.name}/crack/steam_api.dll")
+
+    assert sorted(placement.destination for placement in sorter.plan(item)) == [
+        sorter.GAMES / "Undertale (2015)" / "crack" / "steam_api.dll",
+        sorter.GAMES / "Undertale (2015)" / "disc1.iso",
+        sorter.GAMES / "Undertale (2015)" / "disc2.iso",
+    ]
+
+
+def test_plan_game_without_a_group_names_the_image_after_the_game(library):
+    item = sorter.DOWNLOADS / "Graveyard Keeper 2"
+    download(f"{item.name}/gk2.iso")
+
+    assert sorter.plan(item)[0].destination == sorter.GAMES / "Graveyard Keeper II (2026)" / "Graveyard Keeper II.iso"
+
+
+def test_plan_game_files_every_game_in_a_folder_of_games(library):
+    item = sorter.DOWNLOADS / "Games"
+    download("Games/Baba Is You-ElAmigos/Baba.Is.You-ElAmigos/Baba Is You.iso")
+    download("Games/Undertale-ALiAS/Undertale-ALiAS/undertale.iso")
+
+    assert sorted(placement.destination for placement in sorter.plan(item)) == [
+        sorter.GAMES / "Baba Is You (2019)" / "Baba Is You-ElAmigos.iso",
+        sorter.GAMES / "Undertale (2015)" / "Undertale-ALiAS.iso",
+    ]
+
+
+@pytest.mark.parametrize("release, folder", [
+    ("Phantom Blade Zero update 301524 - 302256 - more games on GLOAD.cc", "update-301524-302256"),
+    ("Hollow.Knight.Update.v1.5.78-ElAmigos", "update-v1.5.78"),
+    ("Wartales v1.0.2 to v1.0.3 Update-ElAmigos", "update-v1.0.2-v1.0.3"),
+    ("Wartales.Update-ElAmigos", "update"),
+    ("Phantom.Blade.Zero.Deluxe.Edition.Hypervisor-ElAmigos - more games on GLOAD.cc", None),
+])
+def test_update_folder_name(release, folder):
+    assert sorter.update_folder_name(release) == folder
+
+
+def test_plan_game_puts_an_update_into_its_own_folder_inside_the_game(library):
+    (sorter.GAMES / "Phantom Blade Zero (2025)").mkdir()
+    item = sorter.DOWNLOADS / "Phantom Blade Zero update 301524 - 302256 - more games on GLOAD.cc"
+    download(f"{item.name}/update.exe")
+    download(f"{item.name}/data.iso")
+
+    assert sorted(placement.destination for placement in sorter.plan(item)) == [
+        sorter.GAMES / "Phantom Blade Zero (2025)" / "update-301524-302256" / "data.iso",
+        sorter.GAMES / "Phantom Blade Zero (2025)" / "update-301524-302256" / "update.exe",
+    ]
+
+
+def test_plan_game_reuses_a_folder_without_the_year(library):
+    (sorter.GAMES / "Undertale").mkdir()
+    item = sorter.DOWNLOADS / "Undertale-ALiAS"
+    download(f"{item.name}/undertale.iso")
+
+    assert sorter.plan(item)[0].destination == sorter.GAMES / "Undertale" / "Undertale-ALiAS.iso"
+
+
+def test_plan_takes_a_game_with_cutscenes_for_a_game(library):
+    item = sorter.DOWNLOADS / "Undertale-ALiAS"
+    download(f"{item.name}/game/undertale.exe", size=5000)
+    download(f"{item.name}/game/movies/intro.mp4", size=1000)
+
+    assert {placement.plex_type for placement in sorter.plan(item)} == {None}
+
+
+def test_plan_takes_a_movie_with_a_stray_installer_for_a_movie(library):
+    item = sorter.DOWNLOADS / "Tornado.2025.1080p"
+    download(f"{item.name}/tornado.mkv", size=5000)
+    download(f"{item.name}/setup.exe")
+
+    assert [placement.plex_type for placement in sorter.plan(item)] == ["movie"]
+
+
+def test_plan_game_without_igdb_keys_leaves_the_download(library, monkeypatch):
+    monkeypatch.setattr(sorter, "igdb_search", REAL_IGDB_SEARCH)
+    monkeypatch.setattr(sorter, "IGDB_CLIENT_ID", "")
+    item = sorter.DOWNLOADS / "Undertale-ALiAS"
+    download(f"{item.name}/undertale.iso")
+
+    with pytest.raises(sorter.NotRecognised, match="IGDB_CLIENT_ID is not set"):
+        sorter.plan(item)
+
+
+def test_watch_files_a_game_without_rescanning_plex(library, host_paths, monkeypatch, caplog):
+    caplog.set_level("INFO")
+    monkeypatch.setattr(sorter, "SETTLE_SECONDS", 0)
+    download("Undertale-ALiAS - more games on GLOAD.cc/Undertale-ALiAS/undertale.iso")
+    download("Undertale-ALiAS - more games on GLOAD.cc/Undertale-ALiAS/readme.txt")
+
+    rescans = run_rounds(monkeypatch, rounds=3)
+
+    assert library_files(library) == ["games/Undertale (2015)/Undertale-ALiAS.iso", "games/Undertale (2015)/readme.txt"]
+    assert not (sorter.DOWNLOADS / "Undertale-ALiAS - more games on GLOAD.cc").exists()
+    assert rescans == []
+    assert (
+        "Moved Undertale-ALiAS - more games on GLOAD.cc/Undertale-ALiAS -> /mnt/games/Undertale (2015) (2 files)"
+        in caplog.text
+    )
+
+
+def test_a_game_of_one_file_logs_its_new_name(library, host_paths, caplog):
+    caplog.set_level("INFO")
+    item = sorter.DOWNLOADS / "Undertale-ALiAS"
+    download(f"{item.name}/undertale.iso")
+
+    sorter.file_into_library(item, sorter.plan(item))
+
+    assert "Moved Undertale-ALiAS/undertale.iso -> /mnt/games/Undertale (2015)/Undertale-ALiAS.iso" in caplog.text
+
+
+def test_igdb_search_asks_for_a_token_once_and_renews_it_when_rejected(monkeypatch):
+    monkeypatch.setattr(sorter, "IGDB_CLIENT_ID", "client")
+    monkeypatch.setattr(sorter, "IGDB_CLIENT_SECRET", "secret")
+    tokens = iter(["first", "second"])
+    sent = []
+
+    def fake_urlopen(request, data=None, timeout=None):
+        if request == "https://id.twitch.tv/oauth2/token":
+            assert b"client_secret=secret" in data
+            return FakeResponse(json.dumps({"access_token": next(tokens)}).encode())
+        sent.append(request.get_header("Authorization"))
+        if len(sent) == 2:
+            raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, None)
+        return FakeResponse(b"[]")
+
+    monkeypatch.setattr(sorter.urllib.request, "urlopen", fake_urlopen)
+    REAL_IGDB_SEARCH("Undertale")
+    REAL_IGDB_SEARCH("Undertale")
+
+    assert sent == ["Bearer first", "Bearer first", "Bearer second"]
+
+
+def test_igdb_token_stops_on_rejected_keys(monkeypatch):
+    def rejected(url, data=None, timeout=None):
+        raise urllib.error.HTTPError(url, 400, "Bad Request", {}, None)
+
+    monkeypatch.setattr(sorter.urllib.request, "urlopen", rejected)
+    with pytest.raises(SystemExit, match="Twitch rejected"):
+        sorter.igdb_token()
 
 
 # Plex
