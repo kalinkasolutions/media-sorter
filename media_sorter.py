@@ -225,17 +225,26 @@ def search_attempts(title: str, year: int | None) -> list[tuple[str, int | None]
 def tmdb_lookup(kind: str, title: str, year: int | None) -> TmdbMatch | None:
     """Returns the canonical "Title (Year)" and id of a movie or tv show, or None if TMDb doesn't know it."""
     year_param = "year" if kind == "movie" else "first_air_date_year"
+    date_field = "release_date" if kind == "movie" else "first_air_date"
     for query, year_filter in search_attempts(title, year):
         params = {"query": query}
         if year_filter:
             params[year_param] = year_filter
         results = tmdb_search(kind, params)
+        if year_filter:
+            # TMDb's year filter takes any release, so The Eagle Huntress (2016) passes 2026 for a festival screening
+            results = [result for result in results if released_near(result.get(date_field), year_filter)] or results
         if results:
             best = results[0]
             name = best["title"] if kind == "movie" else best["name"]
-            date = best.get("release_date" if kind == "movie" else "first_air_date") or ""
+            date = best.get(date_field) or ""
             return TmdbMatch(safe_filename(f"{name} ({date[:4]})" if date else name), best["id"])
     return None
+
+
+def released_near(date: str | None, year: int) -> bool:
+    """Whether a first release date lies within a year of year; German releases often come a year later."""
+    return bool(date) and date[:4].isdigit() and abs(int(date[:4]) - year) <= 1
 
 
 def plan(item: Path) -> list[Placement]:
