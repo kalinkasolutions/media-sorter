@@ -11,7 +11,8 @@ import media_sorter as sorter
 # taken before the autouse fixture swaps it for the fake catalogue
 REAL_TMDB_SEARCH = sorter.tmdb_search
 
-# As strict as TMDb's search API: every query word must be in the title, and the year must match.
+# As strict as TMDb's search API: every query word must be in the title, and the year must match
+# the first release or, for movies, any later one.
 CATALOGUE = {
     "movie": [
         {"title": "Tornado", "release_date": "2025-06-06", "id": 100},
@@ -22,6 +23,8 @@ CATALOGUE = {
         {"title": "2001: A Space Odyssey", "release_date": "1968-04-02", "id": 105},
         {"title": "13 Hours: The Secret Soldiers of Benghazi", "release_date": "2016-01-13", "id": 106},
         {"title": "28 Years Later: The Bone Temple", "release_date": "2026-01-14", "id": 107},
+        {"title": "The Eagle Huntress", "release_date": "2016-11-02", "later_release_years": ["2026"], "id": 111},
+        {"title": "The Huntress", "release_date": "2026-01-22", "id": 112},
     ],
     "tv": [
         {"name": "Elsbeth", "first_air_date": "2024-02-29", "id": 108},
@@ -43,7 +46,8 @@ def fake_tmdb_search(kind: str, params: dict) -> list[dict]:
     year = params.get("year") or params.get("first_air_date_year")
     return [
         entry for entry in CATALOGUE[kind]
-        if words(params["query"]) <= words(entry[title_field]) and (not year or entry[date_field][:4] == str(year))
+        if words(params["query"]) <= words(entry[title_field])
+        and (not year or str(year) in [entry[date_field][:4], *entry.get("later_release_years", [])])
     ]
 
 
@@ -187,6 +191,10 @@ def test_tmdb_lookup_does_not_guess_a_different_movie_by_leaving_words_out():
 
 def test_tmdb_lookup_falls_back_to_no_year_when_the_year_is_off():
     assert sorter.tmdb_lookup("movie", "Tornado", 2024).name == "Tornado (2025)"
+
+
+def test_tmdb_lookup_skips_an_old_movie_that_matches_the_year_only_by_a_later_screening():
+    assert sorter.tmdb_lookup("movie", "The Huntress", 2026).name == "The Huntress (2026)"
 
 
 def test_tmdb_lookup_makes_the_name_safe_for_a_folder():
