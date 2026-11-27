@@ -13,4 +13,6 @@ ENV VERSION=$VERSION \
     SERIES=/series \
     GAMES=/games
 
+EXPOSE 14141
+
 CMD ["python", "/app/media_sorter.py"]

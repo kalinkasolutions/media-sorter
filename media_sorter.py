@@ -7,6 +7,10 @@ Games:   GAMES/Game (Year)/Game-Group.iso, other files keep their names and subf
 Updates: GAMES/Game (Year)/update-301524-302256/<original file names>
 
 Anything that isn't a recognisable movie or episode is left where it is.
+
+An HTTP API on API_PORT (default 14141) names a video the same way, for tools that convert or rename
+files: POST /identify {"path": ..., "codec": "HEVC", "resolution": "1080p"} (codec and resolution
+optional), GET /health. No authentication, so it must only be reachable from the internal network.
 """
 
 import contextlib
@@ -18,10 +22,12 @@ import os
 import re
 import shutil
 import signal
+import threading
 import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from guessit import guessit
@@ -46,6 +52,7 @@ DRY_RUN = os.environ.get("DRY_RUN") == "1"
 # a dry run moves nothing, so it needn't wait for downloads to settle
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "5" if DRY_RUN else "30"))
 SETTLE_SECONDS = int(os.environ.get("SETTLE_SECONDS", "0" if DRY_RUN else "300"))
+API_PORT = int(os.environ.get("API_PORT", "14141"))
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".wmv"}
 # disc images and installers; the folder holding one is a game
@@ -290,6 +297,23 @@ def released_near(date: str | None, year: int) -> bool:
     return bool(date) and date[:4].isdigit() and abs(int(date[:4]) - year) <= 1
 
 
+def episode_number_in_season(stem: str, season: int) -> int | None:
+    """601 in "tvs-mf-x264-601" for season 6; the season must lead, so 1080p, x264 or a year never count."""
+    numbers = re.findall(rf"(?<![0-9A-Za-z])0?{season}(\d{{2}})(?![0-9A-Za-z])", stem)
+    return int(numbers[-1]) if numbers else None
+
+
+def guess_release(relative_path: str) -> dict:
+    """guessit's reading of a download, with the episode it misses in "Show.S06.../tvs-mf-x264-601.mkv"."""
+    guess = dict(guessit(relative_path))
+    season = guess.get("season")
+    if guess.get("type") == "episode" and isinstance(season, int) and guess.get("episode") is None:
+        episode = episode_number_in_season(Path(relative_path).stem, season)
+        if episode is not None:
+            guess["episode"] = episode
+    return guess
+
+
 def plan(item: Path) -> list[Placement]:
     game_roots = game_roots_in(item)
     # games carry cutscene videos, and a movie can come with a stray setup.exe
@@ -301,7 +325,7 @@ def plan(item: Path) -> list[Placement]:
         raise NotRecognised("no video or game file")
 
     # guessit reads the folder names too, which often carry the info the file name lacks
-    guesses = {video: guessit(str(video.relative_to(DOWNLOADS))) for video in videos}
+    guesses = {video: guess_release(str(video.relative_to(DOWNLOADS))) for video in videos}
     main = guesses[videos[0]]
 
     if main.get("type") == "episode":
@@ -310,6 +334,10 @@ def plan(item: Path) -> list[Placement]:
 
 
 def plan_movie(video: Path, guess: dict) -> Placement:
+    return Placement(video, library_folder(MOVIES, "movie", movie_match(video, guess)) / video.name, "movie")
+
+
+def movie_match(video: Path, guess: dict) -> TmdbMatch:
     if "title" not in guess:
         raise NotRecognised(f"no title in {video.name}")
     # guessit splits "Dune.Part.Two" into title "Dune" and part 2
@@ -318,10 +346,17 @@ def plan_movie(video: Path, guess: dict) -> Placement:
     if not match:
         year = f" ({guess['year']})" if guess.get("year") else ""
         raise NotRecognised(f"TMDb has no movie '{guess['title']}'{year}")
-    return Placement(video, library_folder(MOVIES, "movie", match) / video.name, "movie")
+    return match
 
 
 def plan_episode(video: Path, guess: dict) -> Placement:
+    show = show_match(video, guess)
+    folder = season_folder(library_folder(SERIES, "tv", show), guess["season"])
+    file_name = episode_file_name(show, guess) + video.suffix.lower()
+    return Placement(video, folder / file_name, "show")
+
+
+def show_match(video: Path, guess: dict) -> TmdbMatch:
     if guess.get("type") != "episode" or not {"title", "season", "episode"} <= guess.keys():
         raise NotRecognised(f"no season/episode in {video.name}")
     if isinstance(guess["season"], list):
@@ -329,19 +364,120 @@ def plan_episode(video: Path, guess: dict) -> Placement:
     show = tmdb_lookup("tv", guess["title"], guess.get("year"))
     if not show:
         raise NotRecognised(f"TMDb has no series '{guess['title']}'")
-    folder = season_folder(library_folder(SERIES, "tv", show), guess["season"])
-    file_name = episode_file_name(show, guess) + video.suffix.lower()
-    return Placement(video, folder / file_name, "show")
+    return show
+
+
+def episode_numbers(guess: dict) -> list[int]:
+    return guess["episode"] if isinstance(guess["episode"], list) else [guess["episode"]]
 
 
 def episode_file_name(show: TmdbMatch, guess: dict) -> str:
     """Like "Modern.Family.s04.e02.Schooled.1080p.HEVC", leaving out what TMDb or the release doesn't say."""
     season = guess["season"]
-    episodes = guess["episode"] if isinstance(guess["episode"], list) else [guess["episode"]]
+    episodes = episode_numbers(guess)
     titles = episode_titles(show.id, season)
     title = "+".join(dict.fromkeys(filter(None, (dotted(titles[number]) for number in episodes if number in titles))))
     parts = [dotted(without_year(show.name)), episode_code(season, episodes), title, guess.get("screen_size"), codec_label(guess.get("video_codec"))]
     return ".".join(filter(None, parts))
+
+
+def release_path(path: str) -> str:
+    """The part of path guessit should read: below the downloads folder, else the file and two folders above it."""
+    for root in filter(None, (HOST_DOWNLOADS, str(DOWNLOADS))):
+        if Path(path).is_relative_to(root):
+            return str(Path(path).relative_to(root))
+    return str(Path(*Path(path).parts[-3:]))
+
+
+def split_name(name: str) -> tuple[str, int | None]:
+    """"Modern Family (2009)" -> ("Modern Family", 2009)."""
+    year = re.search(r"\((\d{4})\)$", name)
+    return without_year(name), int(year[1]) if year else None
+
+
+def identify(path: str, codec: str | None = None, resolution: str | None = None) -> dict:
+    """What the API tells about a video; codec and resolution replace the release's, for a converted copy."""
+    video = Path(path)
+    guess = guess_release(release_path(path))
+    # in a library, "Elsbeth/Season 3/4sf-elsbeth-sd-s03e02.mkv": the show folder names the show, the file doesn't
+    if guess.get("type") == "episode" and season_number_in(video.parent.name) is not None:
+        show_folder = guessit(video.parent.parent.name)
+        guess.update({key: show_folder[key] for key in ("title", "year") if key in show_folder})
+    if codec:
+        guess["video_codec"] = codec
+    if resolution:
+        guess["screen_size"] = resolution
+    quality = {"resolution": guess.get("screen_size"), "codec": codec_label(guess.get("video_codec"))}
+
+    if guess.get("type") == "episode":
+        show = show_match(video, guess)
+        series, year = split_name(show.name)
+        titles = episode_titles(show.id, guess["season"])
+        episodes = episode_numbers(guess)
+        return {
+            "kind": "episode", "tmdb_id": show.id, "series": series, "year": year,
+            "season": guess["season"], "episodes": episodes,
+            "episode_title": " + ".join(dict.fromkeys(titles[number] for number in episodes if number in titles)) or None,
+            **quality,
+            "file_name": episode_file_name(show, guess) + video.suffix.lower(),
+            "library_folder": shown(season_folder(library_folder(SERIES, "tv", show), guess["season"])),
+        }
+
+    movie = movie_match(video, guess)
+    title, year = split_name(movie.name)
+    return {
+        "kind": "movie", "tmdb_id": movie.id, "title": title, "year": year, **quality,
+        # the sorter keeps a movie's file name, so this is only a suggestion for tools that rename
+        "file_name": " ".join(filter(None, [movie.name, quality["resolution"], quality["codec"]])) + video.suffix.lower(),
+        "library_folder": shown(library_folder(MOVIES, "movie", movie)),
+    }
+
+
+API_USAGE = 'use POST /identify {"path": ..., "codec": "HEVC", "resolution": "1080p"} or GET /health'
+
+
+class ApiHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path == "/health":
+            self.reply(200, {"version": VERSION})
+        else:
+            self.reply(404, {"error": API_USAGE})
+
+    def do_POST(self) -> None:
+        if self.path != "/identify":
+            return self.reply(404, {"error": API_USAGE})
+        try:
+            request = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+            path, codec, resolution = request["path"], request.get("codec"), request.get("resolution")
+            if not all(isinstance(value, str) for value in (path, codec or "", resolution or "")):
+                raise TypeError
+        except (ValueError, KeyError, TypeError):
+            return self.reply(400, {"error": API_USAGE})
+        try:
+            self.reply(200, identify(path, codec, resolution))
+        except NotRecognised as reason:
+            self.reply(404, {"error": str(reason)})
+        # SystemExit: tmdb_get's answer to a rejected key must not end the API's thread
+        except (Exception, SystemExit) as error:
+            log.exception("API request failed for %s", path)
+            self.reply(502, {"error": str(error)})
+
+    def reply(self, status: int, body: dict) -> None:
+        data = json.dumps(body, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, format: str, *args) -> None:
+        log.debug("API: " + format, *args)
+
+
+def serve_api(port: int) -> ThreadingHTTPServer:
+    server = ThreadingHTTPServer(("", port), ApiHandler)
+    threading.Thread(target=server.serve_forever, name="api", daemon=True).start()
+    return server
 
 
 def is_mostly_video(item: Path) -> bool:
@@ -601,7 +737,7 @@ def startup_message(entries: int) -> str:
     return (
         f"media-sorter {VERSION}{' (dry run)' if DRY_RUN else ''}: watching {shown(DOWNLOADS)} "
         f"({entries} {'entry' if entries == 1 else 'entries'}), "
-        f"checking every {POLL_SECONDS}s, settle time {SETTLE_SECONDS}s"
+        f"checking every {POLL_SECONDS}s, settle time {SETTLE_SECONDS}s, API on port {API_PORT}"
     )
 
 
@@ -689,5 +825,6 @@ if __name__ == "__main__":
         raise SystemExit("TMDB_KEY is not set")
     signal.signal(signal.SIGUSR1, request_run_now)
     signal.signal(signal.SIGTERM, stop)
+    serve_api(API_PORT)
     log.info(startup_message(len(list(DOWNLOADS.iterdir()))))
     watch()
