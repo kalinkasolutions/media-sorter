@@ -383,6 +383,29 @@ def test_plan_episode_takes_the_season_from_the_folder_when_the_file_lacks_it(li
     assert sorter.plan(item)[0].destination == sorter.SERIES / "The Bear (2022)" / "season_02" / "The.Bear.s02.e05.1080p.H264.mkv"
 
 
+TVS_SEASON = "Modern.Family.S01.German.DD51.Dubbed.DL.1080p.AmazonHD.x264-TVS - serienfans.org"
+
+
+def test_plan_episode_numbered_only_by_season_and_episode_digits(library):
+    item = sorter.DOWNLOADS / TVS_SEASON
+    download(f"{item.name}/tvs-mf-dd51-ded-dl-18p-azhd-x264-102.mkv")
+
+    assert sorter.plan(item)[0].destination == (
+        sorter.SERIES / "Modern Family (2009)" / "season_01" / "Modern.Family.s01.e02.The.Bicycle.Thief.1080p.H264.mkv"
+    )
+
+
+@pytest.mark.parametrize("stem, season, episode", [
+    ("tvs-mf-dd51-ded-dl-18p-azhd-x264-601", 6, 1),
+    ("tvs-mf-dd51-ded-dl-18p-azhd-avc-1022", 10, 22),
+    ("tvs-mf-avc-1001 1080p HEVC", 10, 1),
+    ("tvs-mf-dd51-x264-1080p", 10, None),
+    ("tvs-mf-dd51-ded-dl-18p-azhd-x264-601", 5, None),
+])
+def test_episode_number_in_season(stem, season, episode):
+    assert sorter.episode_number_in_season(stem, season) == episode
+
+
 def test_plan_leaves_a_folder_without_video_or_game(library):
     item = sorter.DOWNLOADS / "Well Dweller-ElAmigos"
     download(f"{item.name}/game.part01.rar")
@@ -801,9 +824,11 @@ def test_startup_message(host_paths, monkeypatch):
     monkeypatch.setattr(sorter, "VERSION", "0.0.2")
     monkeypatch.setattr(sorter, "POLL_SECONDS", 30)
     monkeypatch.setattr(sorter, "SETTLE_SECONDS", 300)
+    monkeypatch.setattr(sorter, "API_PORT", 14141)
 
     assert sorter.startup_message(3) == (
-        "media-sorter 0.0.2: watching /mnt/shared/jdownloader (3 entries), checking every 30s, settle time 300s"
+        "media-sorter 0.0.2: watching /mnt/shared/jdownloader (3 entries), checking every 30s, settle time 300s, "
+        "API on port 14141"
     )
     assert "(1 entry)" in sorter.startup_message(1)
 
@@ -1077,3 +1102,101 @@ def test_refresh_plex_does_nothing_in_a_dry_run(monkeypatch):
     monkeypatch.setattr(sorter, "plex_request", lambda path: pytest.fail("Plex was called"))
 
     sorter.refresh_plex({"movie"})
+
+
+# API
+
+
+@pytest.fixture
+def api():
+    server = sorter.serve_api(0)
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+    server.server_close()
+
+
+def call(url: str, body: bytes | None = None) -> tuple[int, dict]:
+    request = sorter.urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with sorter.urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as error:
+        return error.code, json.load(error)
+
+
+def identify(api: str, **fields) -> tuple[int, dict]:
+    return call(f"{api}/identify", json.dumps(fields).encode())
+
+
+def test_api_identifies_an_episode_with_the_converted_codec(library, host_paths, api):
+    path = f"/mnt/shared/jdownloader/{TVS_SEASON}/tvs-mf-dd51-ded-dl-18p-azhd-x264-102.mkv"
+
+    status, body = identify(api, path=path, codec="HEVC")
+
+    assert status == 200
+    assert body == {
+        "kind": "episode", "tmdb_id": 1421, "series": "Modern Family", "year": 2009,
+        "season": 1, "episodes": [2], "episode_title": "The Bicycle Thief",
+        "resolution": "1080p", "codec": "HEVC",
+        "file_name": "Modern.Family.s01.e02.The.Bicycle.Thief.1080p.HEVC.mkv",
+        "library_folder": "/mnt/series/Modern Family (2009)/season_01",
+    }
+
+
+def test_api_reads_a_path_outside_the_downloads_by_its_last_folders(library, api):
+    status, body = identify(api, path="/mnt/media/Elsbeth/Season 3/4sf-elsbeth-sd-s03e02.mkv")
+
+    assert status == 200
+    assert (body["series"], body["season"], body["episodes"]) == ("Elsbeth", 3, [2])
+
+
+def test_api_takes_the_show_from_the_folder_above_a_season_folder(library, api):
+    status, body = identify(api, path="/mnt/media/Modern Family (2009)/season_01/mf-101.mkv")
+
+    assert status == 200
+    assert (body["series"], body["season"], body["episodes"]) == ("Modern Family", 1, [1])
+
+
+def test_api_identifies_a_movie(library, api):
+    status, body = identify(api, path="/x/Dune.Part.Two.2024.1080p.WEB-DL.x265-GRP/movie.mkv")
+
+    assert status == 200
+    assert (body["kind"], body["title"], body["year"], body["tmdb_id"]) == ("movie", "Dune Part Two", 2024, 102)
+    assert body["file_name"] == "Dune Part Two (2024) 1080p HEVC.mkv"
+
+
+def test_api_answers_404_for_what_tmdb_does_not_know(library, api):
+    status, body = identify(api, path="/x/Unknown.Movie.1999.1080p.mkv")
+
+    assert status == 404
+    assert "TMDb has no movie" in body["error"]
+
+
+def test_api_answers_502_when_tmdb_fails(library, api, monkeypatch):
+    def failing_search(kind, params):
+        raise urllib.error.URLError("unreachable")
+
+    monkeypatch.setattr(sorter, "tmdb_search", failing_search)
+
+    status, body = identify(api, path="/x/Dune.2021.mkv")
+
+    assert status == 502
+    assert "unreachable" in body["error"]
+
+
+def test_api_takes_any_character_in_the_path(library, api):
+    status, body = identify(api, path="/x/Dune & Co #1 +100%.2021/movie.mkv")
+
+    assert status == 404
+    assert "'Dune & Co 1' (2021)" in body["error"]
+
+
+@pytest.mark.parametrize("body", [b"", b"not json", b"[]", b"{}", b'{"path": 5}', b'{"path": "/x.mkv", "codec": 1}'])
+def test_api_answers_400_for_a_bad_request(api, body):
+    assert call(f"{api}/identify", body)[0] == 400
+
+
+def test_api_health_and_unknown_paths(api):
+    assert call(f"{api}/health")[0] == 200
+    assert call(f"{api}/identify")[0] == 404
+    assert call(f"{api}/other", b"{}")[0] == 404

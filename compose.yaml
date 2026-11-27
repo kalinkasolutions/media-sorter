@@ -6,6 +6,9 @@ services:
     env_file: media-sorter.env
     # the shares are group storage with no access for others; STORAGE_GID is `getent group storage`
     user: "${PUID:-1000}:${STORAGE_GID:?set STORAGE_GID in .env}"
+    # the naming API has no authentication: publish it on the internal network only
+    ports:
+      - "${API_PORT:-14141}:14141"
     environment:
       # only for the log, so it names the folders as they are on this host
       HOST_DOWNLOADS: ${DOWNLOADS_PATH:-/mnt/shared/jdownloader}
